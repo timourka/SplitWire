@@ -1,0 +1,6 @@
+/dist
+*.log
+last-config.txt
+WinDivert.dll
+WinDivert64.sys
+WinDivert-LICENSE.txt
