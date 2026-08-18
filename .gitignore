@@ -1,4 +1,5 @@
 /dist
+.tools/
 *.log
 last-config.txt
 WinDivert.dll
