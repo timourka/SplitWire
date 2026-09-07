@@ -161,7 +161,7 @@ try {
     $env:GOOS = 'windows'
     $env:GOARCH = 'amd64'
     $env:CGO_ENABLED = '0'
-    & $goExe build -trimpath -ldflags '-s -w' -o dist\SplitWire.exe .\cmd\splitwire
+    & $goExe build -trimpath -ldflags '-s -w -H=windowsgui' -o dist\SplitWire.exe .\cmd\splitwire
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     $env:GOOS = $oldGOOS
@@ -173,7 +173,7 @@ Copy-Item -Force .\splitwire.default.conf .\dist\splitwire.default.conf
 Copy-Item -Force .\README_RU.md .\dist\README_RU.md
 Copy-Item -Force .\THIRD_PARTY_NOTICES.md .\dist\THIRD_PARTY_NOTICES.md
 Copy-Item -Force .\LICENSE .\dist\LICENSE
-Copy-Item -Force .\CHANGELOG_1.1.1.md .\dist\CHANGELOG_1.1.1.md
+Copy-Item -Force .\CHANGELOG_1.2.0.md .\dist\CHANGELOG_1.2.0.md
 Copy-Item -Force .\TEST_RESULTS.txt .\dist\TEST_RESULTS.txt
 Copy-Item -Force .\example.conf .\dist\example.conf
 Copy-Item -Force .\example-custom-groups.conf .\dist\example-custom-groups.conf

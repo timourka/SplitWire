@@ -1,75 +1,61 @@
-SplitWire 1.1.1 validation
-Date: 2026-08-14
+SplitWire 1.2.0 UI validation
+Date: 2026-08-21
 
-Host test environment:
+Host validation environment:
 - Linux amd64
 - Go 1.23+
 
-1) Unit/integration tests
-Command: go test ./...
+1) Unit / integration tests
+Command:
+  go test ./...
 Result: PASS
 
-Covered areas include:
-- splitwire.default.conf fallback and embedded-config override
-- arbitrary [Group "..."] parsing
-- strict exact / *.domain wildcard semantics
-- Apps=* and Domains=*
-- OR between groups / AND inside groups
-- group-aware domain IP cache isolation
-- hostname proxy per-client WireGuard/DIRECT routing decision
-- pre-connect proxy route table exact flow matching
-- regression: reserved source port + single bind + successful TCP connection
-- flow/process tracking
-- DNS parsing
-- TLS SNI discovery
-- packet parsing/checksums/MSS
-- NAT/reverse-NAT/UDP port mapping
-- WireGuard crypto/data-plane helpers
+New 1.2.0 coverage includes:
+- app.Inspect default-rules resolution
+- last-config save/load
+- existing routing/config/domain/proxy/NAT/WireGuard tests from 1.1.1
 
 2) Static analysis
-Command: go vet ./...
+Command:
+  go vet ./...
 Result: PASS
 
 3) Race detector
-Command: go test -race ./...
+Command:
+  go test -race ./...
 Result: PASS
 
-4) Policy scaling microbenchmark
+4) Windows-specific vet
 Command:
-  go test ./internal/policy -run '^$' -bench BenchmarkDecideIndexedGroups -benchmem -count=1
+  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/splitwire ./internal/app
+Result: PASS
 
-Observed on this CI VM (AMD EPYC 9V74; Linux; policy-only, NOT WinDivert/WireGuard end-to-end):
-- 3 groups:   ~228.5 ns/op, 32 B/op, 2 allocs/op
-- 50 groups:  ~236.3 ns/op, 32 B/op, 2 allocs/op
-- 500 groups: ~240.1 ns/op, 32 B/op, 2 allocs/op
+5) Native Windows GUI cross-build
+Command:
+  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags '-s -w -H=windowsgui' -o SplitWire.exe ./cmd/splitwire
+Result: PASS
 
-Interpretation: unrelated application groups are indexed, so increasing unrelated groups did not produce linear packet-policy cost in this benchmark. Exact values are hardware/runtime dependent.
+Binary identification:
+  PE32+ executable for MS Windows 6.01 (GUI), x86-64, 8 sections
 
-5) Independent WireGuard interoperability smoke test
+SHA-256 SplitWire.exe:
+  8c073c29e36ca66929b9e77325c998750482ccc3f486a0105fe6c550f0142afd
+
+6) Independent WireGuard interoperability smoke test
 Python responder: cryptography X25519 + ChaCha20-Poly1305
 Go initiator: SplitWire WireGuard implementation
 Result:
   GO_WIREGUARD_INTEROP_OK
   PY_WIREGUARD_INTEROP_OK
 
-6) Windows-specific compile regression check
+7) Policy scaling microbenchmark
 Command:
-  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test ./internal/engine -c
-Result: PASS
+  go test ./internal/policy -run '^$' -bench BenchmarkDecideIndexedGroups -benchmem -count=1
 
-The Windows test binary includes the 1.1.0 double-bind regression test path. The same source-port registration algorithm is also exercised as a real TCP connection by the host unit test.
-
-7) Windows x64 cross-build
-Commands:
-  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o dist/SplitWire.exe ./cmd/splitwire
-  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
-Result: PASS
-
-Binary identification:
-  PE32+ executable for MS Windows 6.01 (console), x86-64
-
-SHA-256 dist/SplitWire.exe:
-  21ba6b17ee3abb5283b1140029972ff5fbb0f1343b64d1fff457390612bea329
+Observed on this VM (AMD EPYC 9V74; Linux; policy-only, not WinDivert/WireGuard end-to-end):
+- 3 groups:   ~242.8 ns/op, 32 B/op, 2 allocs/op
+- 50 groups:  ~251.7 ns/op, 32 B/op, 2 allocs/op
+- 500 groups: ~250.6 ns/op, 32 B/op, 2 allocs/op
 
 Important validation boundary:
-The current environment is Linux, so it cannot load the WinDivert Windows kernel driver or perform a real Windows + corporate VPN + live WireGuard end-to-end test. The specific 1.1.0 failure was identified from the user-provided Windows log as a double-bind before ConnectEx; 1.1.1 removes that bind, tests the pre-connect registration algorithm with a real TCP connection, and cross-compiles the Windows code successfully.
+The native Win32 UI was cross-compiled and vetted, but this environment is Linux and cannot visually run the Windows window, load the WinDivert kernel driver, or perform a real Windows + corporate VPN end-to-end test. Runtime routing code itself was not replaced; 1.2.0 moves lifecycle management into internal/app and wraps the existing engine with a native GUI.

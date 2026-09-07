@@ -1,23 +1,23 @@
-# SplitWire 1.1.1
+# SplitWire 1.2.0
 
 SplitWire — переносимый Windows-клиент для выборочного WireGuard-туннелирования без Wintun/TUN-адаптера и без добавления системных маршрутов Windows.
 
 Приложение рассчитано на одновременную работу с другим VPN: корпоративный VPN продолжает управлять обычной маршрутизацией Windows, а SplitWire перехватывает только трафик, который совпал с его правилами, и отправляет его в отдельный WireGuard peer.
 
-**SplitWire не является Windows Service и не создаёт Scheduled Task.** Пока `SplitWire.exe` запущен — правила активны. Закрыли окно или нажали `Q` + Enter — packet-filter handles закрыты и SplitWire больше не обрабатывает трафик.
+**SplitWire не является Windows Service и не создаёт Scheduled Task.** Туннель активен только после нажатия **«Подключить»** и пока работает `SplitWire.exe`. Нажатие **«Отключить»** или закрытие окна восстанавливает временный PAC, закрывает WinDivert handles и полностью выключает SplitWire.
 
 ## Быстрый запуск
 
-1. Положите рядом:
-   - `SplitWire.exe`;
-   - `splitwire.default.conf`.
-2. Запустите `SplitWire.exe`.
-3. Подтвердите UAC: права администратора нужны WinDivert.
-4. Укажите путь к обычному WireGuard `.conf`.
-5. В дальнейшем путь запоминается в `last-config.txt`.
-6. `S` + Enter — статус, `Q` + Enter — завершение.
+1. Положите рядом `SplitWire.exe` и `splitwire.default.conf`.
+2. Запустите `SplitWire.exe` и подтвердите UAC: права администратора нужны WinDivert.
+3. В поле **«Конфиг»** выберите обычный WireGuard `.conf` через **«Обзор…»**.
+4. Проверьте загруженные группы слева и нажмите **«Подключить»**.
+5. Кнопка **«Отключить»** выключает SplitWire без закрытия приложения.
+6. Закрытие окна также гарантированно выключает туннель и восстанавливает временные proxy/PAC settings.
 
-Можно сразу передать конфиг:
+Путь к последнему WireGuard-конфигу сохраняется в `last-config.txt` и подставляется при следующем запуске.
+
+Конфиг можно заранее передать аргументом — UI откроется уже с заполненным путём:
 
 ```powershell
 .\SplitWire.exe "C:\VPN\my-wireguard.conf"
@@ -29,7 +29,22 @@ SplitWire — переносимый Windows-клиент для выбороч�
 .\SplitWire.exe --config "C:\VPN\my-wireguard.conf"
 ```
 
-При первом запуске SplitWire при необходимости скачивает официальный x64 runtime WinDivert 2.2.2. Собственного kernel-драйвера SplitWire не устанавливает.
+При первом подключении SplitWire при необходимости скачивает официальный x64 runtime WinDivert 2.2.2. Собственного kernel-драйвера SplitWire не устанавливает.
+
+## UI
+
+В 1.2.0 консольный интерфейс заменён на небольшое native Win32-окно. В проект не добавлены UI-фреймворки, WebView, CGO или новые runtime-зависимости.
+
+Основные элементы:
+
+- **Конфиг / Обзор…** — выбор WireGuard `.conf`;
+- **Правила** — открывает фактически используемый источник правил: `splitwire.default.conf` или WireGuard-конфиг с собственными `[Group]`; изменения применяются при следующем подключении;
+- **Подключить / Отключить** — явное управление runtime без Windows Service;
+- блок **Состояние** — physical interface, WireGuard endpoint, последний handshake, hostname/PAC mode, WG TX/RX и основные packet counters;
+- **Группы маршрутизации** — показывает текущие `Apps`, `Domains` и `Networks`;
+- **Лог** — live tail `splitwire.log`; кнопка **«Открыть лог»** открывает файл обычным Windows-приложением, **«Очистить окно»** очищает только UI, не файл.
+
+UI читает статус непосредственно из того же `engine.Runner`, который маршрутизирует трафик. Отдельного фонового helper/service процесса нет.
 
 ## WireGuard-конфиг и default config
 
@@ -351,52 +366,65 @@ SplitWire не пытается перезаписать уже существу
 
 ## Статус
 
-`S` + Enter показывает примерно:
+Основной статус теперь отображается в окне и обновляется раз в секунду:
 
 ```text
-captured / tunnel / bypass / dropped
-WG tx / rx
-learnedIPs
-proc=resolved/missed
-discovery / domain / sni / quicFallback / reconnects
-proxyWG / proxyDirect
-last handshake
+состояние runtime / handshake
+physical interface / WireGuard endpoint
+hostname PAC mode
+WG TX / RX
+tunnel / bypass / dropped
+proxyWG
 ```
 
-`proxyWG` — hostname proxy запросы, которые после проверки исходного процесса были направлены в WireGuard.
+Подробные диагностические счётчики (`captured`, `learnedIPs`, `proc resolved/missed`, `discovery`, `domain`, `sni`, `quicFallback`, `reconnects`, `proxyDirect`) остаются внутри engine и технического лога; UI специально показывает только основные показатели, чтобы не превращаться в dashboard на десятки полей.
 
-`proxyDirect` — hostname proxy запросы, попавшие в PAC по домену, но **не** совпавшие с app+domain группой исходного процесса и поэтому явно отправленные DIRECT.
+`proxyWG` — hostname proxy запросы, которые после проверки исходного процесса были направлены в WireGuard. `proxyDirect` — запросы, попавшие в PAC по домену, но не совпавшие с app+domain группой исходного процесса и поэтому отправленные DIRECT.
 
 ## Сборка
 
-Нужен Go 1.23+.
-
-На Windows x64:
+На Windows x64 достаточно клонировать репозиторий и запустить:
 
 ```powershell
 .\scripts\build.ps1
 ```
 
-Скрипт выполняет:
+Если Go 1.23+ уже есть в `PATH`, скрипт использует его. Если Go отсутствует или слишком старый, `build.ps1` сам скачивает официальный Windows x64 ZIP с `go.dev`, проверяет SHA-256 из официального download API и распаковывает portable toolchain в `.tools\go`. Системная установка Go и изменение `PATH` не требуются. Каталог `.tools` исключён из Git.
+
+Обычная release-сборка выполняет:
 
 ```text
 go test ./...
 go vet ./...
-go test -race ./...
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ...
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -H=windowsgui" ...
 ```
 
-После сборки папка `dist` содержит:
+Race detector намеренно не запускается по умолчанию: на Windows он требует cgo и установленный C compiler. Для dev-проверки, если подходящий mingw-w64/clang уже установлен:
+
+```powershell
+.\scripts\build.ps1 -Race
+```
+
+После сборки папка `dist` содержит native GUI executable и portable-файлы:
 
 ```text
 SplitWire.exe
 splitwire.default.conf
 README_RU.md
 THIRD_PARTY_NOTICES.md
+CHANGELOG_1.2.0.md
 remove-windivert-driver.ps1
 ```
 
+`SplitWire.exe` собирается как Windows GUI subsystem (`-H=windowsgui`), поэтому рядом не появляется отдельное консольное окно.
+
 Запуск:
+
+```powershell
+.\dist\SplitWire.exe
+```
+
+или с заранее выбранным конфигом:
 
 ```powershell
 .\dist\SplitWire.exe "C:\VPN\my-wireguard.conf"
