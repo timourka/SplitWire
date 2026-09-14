@@ -29,10 +29,9 @@ type Runner struct{}
 func Start(context.Context, Params) (*Runner, error) {
 	return nil, errors.New("SplitWire runtime is Windows-only")
 }
-func (*Runner) Close()                      {}
-func (*Runner) Status() Status              { return Status{} }
-func (*Runner) Interface() string           { return "" }
-func (*Runner) SetAggressiveDiscovery(bool) {}
+func (*Runner) Close()            {}
+func (*Runner) Status() Status    { return Status{} }
+func (*Runner) Interface() string { return "" }
 func (*Runner) AuthorizeProxyClient(clientAddr, proxyAddr, host string) (bool, string) {
 	return false, "windows-only"
 }

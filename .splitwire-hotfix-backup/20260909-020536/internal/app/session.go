@@ -155,13 +155,11 @@ func Start(parent context.Context, o Options) (*Session, error) {
 		bp, bpErr := browserproxy.Start(ctx, proxyPatterns, r.AuthorizeProxyClient, r.DialProxy, browserproxy.Logf(o.Logf))
 		if bpErr != nil {
 			s.info.HostnameMode = "DNS/SNI fallback: " + bpErr.Error()
-			r.SetAggressiveDiscovery(true)
 		} else {
 			ps, psErr := winutil.InstallSessionPAC(bp.PACURL())
 			if psErr != nil {
 				_ = bp.Close()
 				s.info.HostnameMode = "DNS/SNI fallback: " + psErr.Error()
-				r.SetAggressiveDiscovery(true)
 				if o.Logf != nil {
 					o.Logf("hostname PAC mode unavailable: %v", psErr)
 				}

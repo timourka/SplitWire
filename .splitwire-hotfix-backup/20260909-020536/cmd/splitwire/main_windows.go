@@ -15,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"splitwire/internal/app"
 	"splitwire/internal/winutil"
@@ -760,36 +761,28 @@ func (g *gui) drainLog() {
 	if g.logEdit == 0 {
 		return
 	}
-	lines := g.logSink.Drain()
-	if len(lines) == 0 {
-		return
+	for _, line := range g.logSink.Drain() {
+		appendEdit(g.logEdit, normalizeEditNewlines(line))
 	}
+	// Keep the UI control bounded even if the on-disk log is very active.
+	if len([]rune(getText(g.logEdit))) > 300000 {
+		r := []rune(getText(g.logEdit))
+		if len(r) > 180000 {
+			setText(g.logEdit, string(r[len(r)-180000:]))
+		}
+	}
+}
 
-	// Do not append through EM_REPLACESEL. The log control is ES_READONLY and
-	// normally never receives focus, so it may have no caret/selection state at
-	// all. On a standard Win32 EDIT this can make EM_REPLACESEL a no-op and the
-	// on-disk log keeps growing while the UI stays blank. WM_SETTEXT works
-	// independently of focus/read-only state, so update the visible buffer in one
-	// batch instead.
-	text := getText(g.logEdit)
-	var b strings.Builder
-	b.Grow(len(text) + 4096)
-	b.WriteString(text)
-	for _, line := range lines {
-		b.WriteString(normalizeEditNewlines(line))
-	}
-	r := []rune(b.String())
-	if len(r) > 300000 {
-		r = r[len(r)-180000:]
-	}
-	setText(g.logEdit, string(r))
-	scrollEditToEnd(g.logEdit)
+func appendEdit(hwnd uintptr, text string) {
+	minusOne := ^uintptr(0)
+	sendMessage(hwnd, emSetSel, minusOne, minusOne)
+	p := utf16Ptr(text)
+	sendMessage(hwnd, emReplaceSel, 0, uintptr(unsafe.Pointer(p)))
+	sendMessage(hwnd, emScrollCaret, 0, 0)
 }
 
 func scrollEditToEnd(hwnd uintptr) {
-	// Use the actual text length instead of the EM_SETSEL(-1,-1) special case.
-	// This is also safe when the user has never focused the read-only log box.
-	n, _, _ := procGetWindowTextLenW.Call(hwnd)
-	sendMessage(hwnd, emSetSel, n, n)
+	minusOne := ^uintptr(0)
+	sendMessage(hwnd, emSetSel, minusOne, minusOne)
 	sendMessage(hwnd, emScrollCaret, 0, 0)
 }

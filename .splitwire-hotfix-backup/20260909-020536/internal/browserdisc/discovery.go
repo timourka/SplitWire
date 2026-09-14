@@ -34,20 +34,21 @@ const (
 )
 
 type Discovery struct {
-	mu   sync.Mutex
-	tls  map[flow.Key]*tlsState
-	quic map[netip.Addr]quicState
-	now  func() time.Time
+	mu    sync.Mutex
+	tls   map[flow.Key]*tlsState
+	reset map[flow.Key]bool
+	quic  map[netip.Addr]quicState
+	now   func() time.Time
 }
 
 func New() *Discovery {
-	return &Discovery{tls: map[flow.Key]*tlsState{}, quic: map[netip.Addr]quicState{}, now: time.Now}
+	return &Discovery{tls: map[flow.Key]*tlsState{}, reset: map[flow.Key]bool{}, quic: map[netip.Addr]quicState{}, now: time.Now}
 }
 
 // FeedTLS appends TCP payload in sequence order and returns a parsed SNI once a
-// ClientHello is complete. TLSNotClientHello marks traffic that did not begin
-// with a ClientHello; callers must not tear down such an unrelated established
-// connection merely to discover its hostname.
+// ClientHello is complete. TLSNotClientHello is useful for connections that
+// were already established before SplitWire started: resetting them once makes
+// Chrome reconnect so the new ClientHello can be classified.
 func (d *Discovery) FeedTLS(k flow.Key, raw []byte) (name string, result TLSResult) {
 	_, ti, err := packet.ParseTCPInfo(raw)
 	if err != nil || len(ti.Payload) == 0 {
@@ -106,7 +107,19 @@ func (d *Discovery) FeedTLS(k flow.Key, raw []byte) (name string, result TLSResu
 func (d *Discovery) DeleteFlow(k flow.Key) {
 	d.mu.Lock()
 	delete(d.tls, k)
+	delete(d.reset, k)
 	d.mu.Unlock()
+}
+
+// MarkReset returns true only the first time it is called for a flow.
+func (d *Discovery) MarkReset(k flow.Key) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.reset[k] {
+		return false
+	}
+	d.reset[k] = true
+	return true
 }
 
 // SuppressUnknownQUIC returns true during a short first-contact window for an

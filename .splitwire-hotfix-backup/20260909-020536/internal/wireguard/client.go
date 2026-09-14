@@ -26,13 +26,6 @@ const (
 	initSize     = 148
 	respSize     = 92
 	cookieSize   = 64
-
-	// WireGuard keys are proactively renewed, but an established session stays
-	// usable while that renewal is happening. Keeping those two deadlines
-	// separate is important for real-time UDP: a periodic rekey must never stall
-	// Discord/Telegram packets behind the handshake RTT.
-	rekeyAfterTime  = 110 * time.Second
-	rejectAfterTime = 170 * time.Second
 )
 
 var zeroNonce = [12]byte{}
@@ -72,7 +65,6 @@ type Client struct {
 	closeOnce          sync.Once
 	txBytes, rxBytes   atomic.Uint64
 	lastHandshake      atomic.Int64
-	rekeying           atomic.Bool
 }
 type session struct {
 	localIndex, remoteIndex uint32
@@ -217,16 +209,12 @@ func (c *Client) log(f string, a ...any) {
 }
 
 func (c *Client) SendPacket(ctx context.Context, raw []byte) error {
-	// Session selection happens before ioMu on purpose. A healthy current key
-	// remains usable while a background rekey runs, so the real-time packet path
-	// never waits for a periodic handshake. ioMu only serializes AEAD use and the
-	// transport counter/write sequence.
+	c.ioMu.Lock()
+	defer c.ioMu.Unlock()
 	s, err := c.ensureSession(ctx)
 	if err != nil {
 		return err
 	}
-	c.ioMu.Lock()
-	defer c.ioMu.Unlock()
 	padded := packet.Pad16(raw)
 	counter := s.sendCounter.Add(1) - 1
 	nonce := make([]byte, 12)
@@ -246,85 +234,22 @@ func (c *Client) SendPacket(ctx context.Context, raw []byte) error {
 	}
 	return err
 }
-
-func sessionUsable(s *session, now time.Time) (usable, shouldRekey bool) {
-	if s == nil || s.sendCounter.Load() >= (1<<60) {
-		return false, false
-	}
-	age := now.Sub(s.created)
-	if age < 0 {
-		age = 0
-	}
-	if age >= rejectAfterTime {
-		return false, false
-	}
-	return true, age >= rekeyAfterTime
-}
-
 func (c *Client) ensureSession(ctx context.Context) (*session, error) {
 	c.sessMu.RLock()
 	s := c.current
 	c.sessMu.RUnlock()
-	if usable, rekey := sessionUsable(s, time.Now()); usable {
-		if rekey {
-			c.startBackgroundRekey(s)
-		}
+	if s != nil && time.Since(s.created) < 110*time.Second && s.sendCounter.Load() < (1<<60) {
 		return s, nil
 	}
-
-	// Startup, or the rare case where a rekey has failed long enough that the
-	// old key reached its hard deadline. Only this path is allowed to wait for a
-	// handshake.
 	c.hsMu.Lock()
 	defer c.hsMu.Unlock()
 	c.sessMu.RLock()
 	s = c.current
 	c.sessMu.RUnlock()
-	if usable, rekey := sessionUsable(s, time.Now()); usable {
-		if rekey {
-			c.startBackgroundRekey(s)
-		}
+	if s != nil && time.Since(s.created) < 110*time.Second {
 		return s, nil
 	}
-	label := "handshake"
-	if s != nil {
-		label = "rekey"
-	}
-	return c.handshake(ctx, label)
-}
-
-func (c *Client) startBackgroundRekey(base *session) {
-	if base == nil || !c.rekeying.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		defer c.rekeying.Store(false)
-		select {
-		case <-c.done:
-			return
-		default:
-		}
-
-		c.hsMu.Lock()
-		defer c.hsMu.Unlock()
-
-		// Another caller may have completed a new handshake while this goroutine
-		// was waiting for hsMu. Do not immediately rekey that fresh session.
-		c.sessMu.RLock()
-		current := c.current
-		c.sessMu.RUnlock()
-		if current != nil && current != base {
-			if usable, rekey := sessionUsable(current, time.Now()); usable && !rekey {
-				return
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		defer cancel()
-		if _, err := c.handshake(ctx, "rekey (non-blocking)"); err != nil {
-			c.log("WireGuard periodic rekey failed; current session was kept: %v", err)
-		}
-	}()
+	return c.handshake(ctx)
 }
 
 type initState struct {
@@ -334,7 +259,7 @@ type initState struct {
 	mac1        [16]byte
 }
 
-func (c *Client) handshake(ctx context.Context, label string) (*session, error) {
+func (c *Client) handshake(ctx context.Context) (*session, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		st, msg, err := c.makeInitiation()
 		if err != nil {
@@ -343,7 +268,7 @@ func (c *Client) handshake(ctx context.Context, label string) (*session, error) 
 		if _, err = c.conn.WriteToUDP(msg, c.endpoint); err != nil {
 			return nil, err
 		}
-		c.log("WireGuard %s attempt %d", label, attempt+1)
+		c.log("WireGuard handshake attempt %d", attempt+1)
 		timer := time.NewTimer(time.Second)
 	wait:
 		for {
@@ -355,7 +280,7 @@ func (c *Client) handshake(ctx context.Context, label string) (*session, error) 
 						timer.Stop()
 						c.installSession(s)
 						c.lastHandshake.Store(time.Now().UnixNano())
-						c.log("WireGuard %s OK", label)
+						c.log("WireGuard handshake OK")
 						return s, nil
 					}
 				}

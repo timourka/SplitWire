@@ -63,20 +63,19 @@ type Runner struct {
 	wgDone    sync.WaitGroup
 	closeOnce sync.Once
 
-	captured            atomic.Uint64
-	tunneled            atomic.Uint64
-	bypassed            atomic.Uint64
-	dropped             atomic.Uint64
-	procResolved        atomic.Uint64
-	procMissed          atomic.Uint64
-	discoveryPackets    atomic.Uint64
-	domainMatches       atomic.Uint64
-	sniLearned          atomic.Uint64
-	quicSuppressed      atomic.Uint64
-	reconnects          atomic.Uint64
-	proxyTunnel         atomic.Uint64
-	proxyDirect         atomic.Uint64
-	aggressiveDiscovery atomic.Bool
+	captured         atomic.Uint64
+	tunneled         atomic.Uint64
+	bypassed         atomic.Uint64
+	dropped          atomic.Uint64
+	procResolved     atomic.Uint64
+	procMissed       atomic.Uint64
+	discoveryPackets atomic.Uint64
+	domainMatches    atomic.Uint64
+	sniLearned       atomic.Uint64
+	quicSuppressed   atomic.Uint64
+	reconnects       atomic.Uint64
+	proxyTunnel      atomic.Uint64
+	proxyDirect      atomic.Uint64
 }
 
 type Params struct {
@@ -219,15 +218,6 @@ func (r *Runner) Status() Status {
 }
 func (r *Runner) Interface() string { return fmt.Sprintf("%s (%d)", r.ifaceName, r.ifaceIndex) }
 
-// SetAggressiveDiscovery enables the destructive hostname-discovery fallback
-// (brief QUIC suppression). It is disabled by default and should only be used
-// when the local PAC proxy cannot be installed. Normal PAC mode does not need
-// to disturb unrelated browser connections.
-func (r *Runner) SetAggressiveDiscovery(enabled bool) {
-	r.aggressiveDiscovery.Store(enabled)
-	r.log("aggressive hostname discovery: %v", enabled)
-}
-
 func (r *Runner) captureLoop(ctx context.Context, sendQ chan<- queuedPacket) {
 	buf := make([]byte, 65535)
 	for {
@@ -290,49 +280,47 @@ func (r *Runner) captureLoop(ctx context.Context, sendQ chan<- queuedPacket) {
 			d = r.policy.Decide(proc, p.Dst)
 		}
 
-		// TLS discovery is only relevant to 443 traffic. Previous versions marked
-		// every packet of every process as a discovery packet as soon as a global
-		// Apps=* hostname group existed (for example YouTube). Besides making the
-		// counters useless, that added avoidable work to the same capture loop that
-		// carries real-time Discord UDP.
-		needsHostname := !proxyKnown && ok && !r.policy.IsInternal(proc) && r.policy.NeedsTLSDiscovery(proc)
-		tlsDiscover := needsHostname && p.Protocol == packet.ProtoTCP && p.DstPort == 443
-		aggressive := r.aggressiveDiscovery.Load() && r.policy.ShouldSuppressQUIC(proc)
-		quicDiscover := aggressive && !proxyKnown && ok && !r.policy.IsInternal(proc) && p.Protocol == packet.ProtoUDP && p.DstPort == 443
-		if tlsDiscover || quicDiscover {
+		discover := !proxyKnown && ok && !r.policy.IsInternal(proc) && r.policy.NeedsTLSDiscovery(proc)
+		if discover {
 			r.discoveryPackets.Add(1)
-		}
-		if tlsDiscover && r.policy.IsDomainIPForProcess(proc, p.Dst) {
-			r.domainMatches.Add(1)
+			if r.policy.IsDomainIPForProcess(proc, p.Dst) {
+				r.domainMatches.Add(1)
+			}
 		}
 
-		// Only use the QUIC->TCP nudge when PAC mode is unavailable. In normal
-		// operation the PAC already has the hostname before the connection exists,
-		// so dropping unrelated browser UDP/443 packets provides no benefit.
-		if quicDiscover && !d.Tunnel {
+		// For explicitly named applications only, briefly suppress unknown QUIC
+		// so TCP/TLS SNI can classify the hostname. Global Apps=* groups never
+		// trigger this, otherwise every process would lose first UDP/443 packets.
+		if discover && !d.Tunnel && r.policy.ShouldSuppressQUIC(proc) && p.Protocol == packet.ProtoUDP && p.DstPort == 443 {
 			if r.discovery.SuppressUnknownQUIC(p.Dst) {
 				r.quicSuppressed.Add(1)
 				continue
 			}
 		}
 
-		if tlsDiscover && !d.Tunnel {
+		if discover && !d.Tunnel && p.Protocol == packet.ProtoTCP && p.DstPort == 443 {
 			name, tlsResult := r.discovery.FeedTLS(key, raw)
 			if tlsResult == browserdisc.TLSClientHello && name != "" {
 				groups := r.domains.AddForName(name, p.Dst, 30*time.Minute)
 				if len(groups) > 0 && r.policy.DecideHost(proc, name).Tunnel {
 					r.sniLearned.Add(1)
-					r.log("TLS SNI matched %s -> learned %s; reconnecting only this matched flow through WireGuard", name, p.Dst.Unmap())
+					r.log("TLS SNI matched %s -> learned %s; reconnecting flow through WireGuard", name, p.Dst.Unmap())
 					if r.resetBrowserTCP(raw, addr, p) {
 						r.reconnects.Add(1)
 					}
 					continue
 				}
 			}
-			// Do not reset an already-established TLS connection merely because its
-			// hostname is unknown. That behavior used to tear down unrelated Chrome
-			// HTTPS flows (VK/Yandex/etc.) just to rediscover their SNI. PAC mode makes
-			// it unnecessary, and fallback mode must prefer stability over guessing.
+			if tlsResult == browserdisc.TLSNotClientHello && r.policy.ShouldSuppressQUIC(proc) && r.discovery.MarkReset(key) {
+				// Explicit app/domain groups get one reconnect attempt for TLS flows
+				// that predate SplitWire. Global groups intentionally do not reset all
+				// existing HTTPS connections on the machine.
+				r.log("restarting pre-existing TLS flow %s:%d -> %s:%d for hostname discovery", p.Src, p.SrcPort, p.Dst, p.DstPort)
+				if r.resetBrowserTCP(raw, addr, p) {
+					r.reconnects.Add(1)
+				}
+				continue
+			}
 		}
 
 		if !d.Tunnel {
