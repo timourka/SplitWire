@@ -147,6 +147,10 @@ func (t *Tracker) Count() int {
 // domain pattern. It is only a seed/fallback; PAC, DNS and TLS SNI discovery
 // remain authoritative for CDN addresses learned at runtime.
 func (t *Tracker) ResolveBootstrap(ctx context.Context, ttl time.Duration) {
+	t.ResolveBootstrapWithResolver(ctx, ttl, net.DefaultResolver)
+}
+
+func (t *Tracker) ResolveBootstrapWithResolver(ctx context.Context, ttl time.Duration, r *net.Resolver) {
 	type item struct {
 		name  string
 		group int
@@ -170,7 +174,9 @@ func (t *Tracker) ResolveBootstrap(ctx context.Context, ttl time.Duration) {
 			items = append(items, item{name: name, group: gi})
 		}
 	}
-	r := net.DefaultResolver
+	if r == nil {
+		r = net.DefaultResolver
+	}
 	for _, it := range items {
 		ips, err := r.LookupNetIP(ctx, "ip", it.name)
 		if err != nil {

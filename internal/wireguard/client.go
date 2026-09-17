@@ -46,6 +46,13 @@ type Params struct {
 	Logf                                    func(string, ...any)
 }
 type responseMsg struct{ raw []byte }
+
+type Diagnostics struct {
+	RawRX, WrongEndpoint, ShortRX, UnknownType, NoSession     uint64
+	AuthFail, ReplayDrop, InvalidInner, PlainQHigh, PlainDrop uint64
+	TransportRX, TXDatagrams, TXErrors                        uint64
+}
+
 type Client struct {
 	p                  Params
 	conn               *net.UDPConn
@@ -73,6 +80,19 @@ type Client struct {
 	txBytes, rxBytes   atomic.Uint64
 	lastHandshake      atomic.Int64
 	rekeying           atomic.Bool
+	rawRX              atomic.Uint64
+	wrongEndpoint      atomic.Uint64
+	shortRX            atomic.Uint64
+	unknownType        atomic.Uint64
+	noSession          atomic.Uint64
+	authFail           atomic.Uint64
+	replayDrop         atomic.Uint64
+	invalidInner       atomic.Uint64
+	plainQHigh         atomic.Uint64
+	plainDrop          atomic.Uint64
+	transportRX        atomic.Uint64
+	txDatagrams        atomic.Uint64
+	txErrors           atomic.Uint64
 }
 type session struct {
 	localIndex, remoteIndex uint32
@@ -80,6 +100,7 @@ type session struct {
 	sendCounter             atomic.Uint64
 	replay                  replay
 	created                 time.Time
+	retiredAt               time.Time
 }
 type replay struct {
 	mu   sync.Mutex
@@ -147,13 +168,15 @@ func New(p Params) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	_ = conn.SetReadBuffer(8 << 20)
+	_ = conn.SetWriteBuffer(8 << 20)
 	if p.InterfaceIndex != 0 {
 		if err := bindUDPToInterface(conn, p.InterfaceIndex, ep.IP.To4() == nil); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("bind WireGuard UDP to physical interface %d: %w", p.InterfaceIndex, err)
 		}
 	}
-	c := &Client{p: p, conn: conn, endpoint: ep, localPort: conn.LocalAddr().(*net.UDPAddr).Port, priv: priv, pub: pub, peerPub: p.PeerPublicKey, psk: p.PresharedKey, respCh: make(chan []byte, 8), cookieCh: make(chan []byte, 8), sessions: map[uint32]*session{}, plain: make(chan []byte, 4096), done: make(chan struct{})}
+	c := &Client{p: p, conn: conn, endpoint: ep, localPort: conn.LocalAddr().(*net.UDPAddr).Port, priv: priv, pub: pub, peerPub: p.PeerPublicKey, psk: p.PresharedKey, respCh: make(chan []byte, 8), cookieCh: make(chan []byte, 8), sessions: map[uint32]*session{}, plain: make(chan []byte, 8192), done: make(chan struct{})}
 	b := append([]byte("mac1----"), c.peerPub[:]...)
 	c.mac1Key = cryptox.Blake2s256(b)
 	b = append([]byte("cookie--"), c.peerPub[:]...)
@@ -192,6 +215,9 @@ func (c *Client) LastHandshake() time.Time {
 	return time.Unix(0, n)
 }
 func (c *Client) Stats() (uint64, uint64) { return c.txBytes.Load(), c.rxBytes.Load() }
+func (c *Client) Diagnostics() Diagnostics {
+	return Diagnostics{RawRX: c.rawRX.Load(), WrongEndpoint: c.wrongEndpoint.Load(), ShortRX: c.shortRX.Load(), UnknownType: c.unknownType.Load(), NoSession: c.noSession.Load(), AuthFail: c.authFail.Load(), ReplayDrop: c.replayDrop.Load(), InvalidInner: c.invalidInner.Load(), PlainQHigh: c.plainQHigh.Load(), PlainDrop: c.plainDrop.Load(), TransportRX: c.transportRX.Load(), TXDatagrams: c.txDatagrams.Load(), TXErrors: c.txErrors.Load()}
+}
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
@@ -217,6 +243,10 @@ func (c *Client) log(f string, a ...any) {
 }
 
 func (c *Client) SendPacket(ctx context.Context, raw []byte) error {
+	if len(raw) > 0 && c.p.MTU > 0 && len(raw) > c.p.MTU {
+		c.txErrors.Add(1)
+		return fmt.Errorf("inner packet %d exceeds tunnel MTU %d", len(raw), c.p.MTU)
+	}
 	// Session selection happens before ioMu on purpose. A healthy current key
 	// remains usable while a background rekey runs, so the real-time packet path
 	// never waits for a periodic handshake. ioMu only serializes AEAD use and the
@@ -243,6 +273,9 @@ func (c *Client) SendPacket(ctx context.Context, raw []byte) error {
 	n, err := c.conn.WriteToUDP(out, c.endpoint)
 	if err == nil {
 		c.txBytes.Add(uint64(n))
+		c.txDatagrams.Add(1)
+	} else {
+		c.txErrors.Add(1)
 	}
 	return err
 }
@@ -521,6 +554,9 @@ func (c *Client) consumeCookie(st initState, msg []byte) error {
 }
 func (c *Client) installSession(s *session) {
 	c.sessMu.Lock()
+	if c.current != nil && c.current != s && c.current.retiredAt.IsZero() {
+		c.current.retiredAt = time.Now()
+	}
 	c.sessions[s.localIndex] = s
 	c.current = s
 	c.sessMu.Unlock()
@@ -532,13 +568,16 @@ func (c *Client) reader() {
 		if err != nil {
 			return
 		}
+		c.rawRX.Add(1)
 		if !sameEndpoint(from, c.endpoint) {
+			c.wrongEndpoint.Add(1)
+			continue
+		}
+		if n < 4 {
+			c.shortRX.Add(1)
 			continue
 		}
 		raw := append([]byte(nil), buf[:n]...)
-		if n < 4 {
-			continue
-		}
 		switch binary.LittleEndian.Uint32(raw[:4]) {
 		case msgResp:
 			select {
@@ -552,12 +591,15 @@ func (c *Client) reader() {
 			}
 		case msgTransport:
 			c.handleTransport(raw)
+		default:
+			c.unknownType.Add(1)
 		}
 	}
 }
 func sameEndpoint(a, b *net.UDPAddr) bool { return a.Port == b.Port && a.IP.Equal(b.IP) }
 func (c *Client) handleTransport(raw []byte) {
 	if len(raw) < 32 {
+		c.shortRX.Add(1)
 		return
 	}
 	idx := binary.LittleEndian.Uint32(raw[4:8])
@@ -565,23 +607,45 @@ func (c *Client) handleTransport(raw []byte) {
 	c.sessMu.RLock()
 	s := c.sessions[idx]
 	c.sessMu.RUnlock()
-	if s == nil || !s.replay.Accept(counter) {
+	if s == nil {
+		c.noSession.Add(1)
 		return
 	}
 	nonce := make([]byte, 12)
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	// Authentication must succeed before the replay window is mutated. An
+	// unauthenticated packet must never be able to burn a future counter value.
 	plain, err := s.recv.Open(nonce, raw[16:], nil)
 	if err != nil {
+		c.authFail.Add(1)
+		return
+	}
+	if !s.replay.Accept(counter) {
+		c.replayDrop.Add(1)
 		return
 	}
 	plain = packet.TrimToIPLength(plain)
-	if len(plain) == 0 {
+	if len(plain) == 0 || (plain[0]>>4 != 4 && plain[0]>>4 != 6) {
+		c.invalidInner.Add(1)
 		return
 	}
 	c.rxBytes.Add(uint64(len(raw)))
+	c.transportRX.Add(1)
+	for {
+		cur := uint64(len(c.plain))
+		old := c.plainQHigh.Load()
+		if cur <= old || c.plainQHigh.CompareAndSwap(old, cur) {
+			break
+		}
+	}
 	select {
 	case c.plain <- plain:
 	case <-c.done:
+	default:
+		// Never stop draining the kernel UDP receive buffer because userspace
+		// injection is temporarily behind. A visible, counted drop here is much
+		// more diagnosable than an invisible kernel-buffer overflow.
+		c.plainDrop.Add(1)
 	}
 }
 
@@ -621,7 +685,7 @@ func (c *Client) reaper() {
 		case <-t.C:
 			c.sessMu.Lock()
 			for idx, s := range c.sessions {
-				if s != c.current && time.Since(s.created) > 3*time.Minute {
+				if s != c.current && !s.retiredAt.IsZero() && time.Since(s.retiredAt) > 3*time.Minute {
 					s.send.Close()
 					s.recv.Close()
 					delete(c.sessions, idx)

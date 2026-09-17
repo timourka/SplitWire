@@ -18,10 +18,22 @@ import (
 const (
 	LayerNetwork = 0
 	LayerFlow    = 2
+	LayerSocket  = 3
 
 	EventNetworkPacket   = 0
 	EventFlowEstablished = 1
 	EventFlowDeleted     = 2
+	EventSocketBind      = 3
+	EventSocketConnect   = 4
+	EventSocketListen    = 5
+	EventSocketAccept    = 6
+	EventSocketClose     = 7
+
+	ParamQueueLength = 0
+	ParamQueueTime   = 1
+	ParamQueueSize   = 2
+
+	MaxPacketSize = 40 + 65535
 
 	FlagSniff    = 0x0001
 	FlagDrop     = 0x0002
@@ -38,6 +50,7 @@ var (
 	procSend          = modWinDivert.NewProc("WinDivertSend")
 	procClose         = modWinDivert.NewProc("WinDivertClose")
 	procCalcChecksums = modWinDivert.NewProc("WinDivertHelperCalcChecksums")
+	procSetParam      = modWinDivert.NewProc("WinDivertSetParam")
 	procFormatIPv6    = modWinDivert.NewProc("WinDivertHelperFormatIPv6Address")
 
 	modKernel32                    = syscall.NewLazyDLL("kernel32.dll")
@@ -60,9 +73,19 @@ type Handle struct {
 }
 
 type FlowEvent struct {
-	Event   uint8
-	Key     flow.Key
-	Process flow.Process
+	Event            uint8
+	EndpointID       uint64
+	ParentEndpointID uint64
+	Key              flow.Key
+	Process          flow.Process
+}
+
+type SocketEvent struct {
+	Event            uint8
+	EndpointID       uint64
+	ParentEndpointID uint64
+	Key              flow.Key
+	Process          flow.Process
 }
 
 func OpenNetwork(filter string, priority int16, flags uint64) (*Handle, error) {
@@ -71,6 +94,10 @@ func OpenNetwork(filter string, priority int16, flags uint64) (*Handle, error) {
 
 func OpenFlow(filter string, priority int16) (*Handle, error) {
 	return open(filter, LayerFlow, priority, FlagSniff|FlagRecvOnly)
+}
+
+func OpenSocket(filter string, priority int16) (*Handle, error) {
+	return open(filter, LayerSocket, priority, FlagSniff|FlagRecvOnly)
 }
 
 func open(filter string, layer uint8, priority int16, flags uint64) (*Handle, error) {
@@ -101,6 +128,33 @@ func (h *Handle) Close() error {
 	h.h = 0
 	if r == 0 && e != syscall.Errno(0) {
 		return e
+	}
+	return nil
+}
+
+func (h *Handle) SetParam(param uint64, value uint64) error {
+	if h == nil || h.h == 0 || h.h == invalidHandle {
+		return errors.New("invalid WinDivert handle")
+	}
+	r, _, e := procSetParam.Call(h.h, uintptr(param), uintptr(value))
+	if r == 0 {
+		if e == syscall.Errno(0) {
+			e = errors.New("WinDivertSetParam failed")
+		}
+		return e
+	}
+	return nil
+}
+
+func (h *Handle) TuneQueue() error {
+	if err := h.SetParam(ParamQueueLength, 16384); err != nil {
+		return err
+	}
+	if err := h.SetParam(ParamQueueSize, 32<<20); err != nil {
+		return err
+	}
+	if err := h.SetParam(ParamQueueTime, 4000); err != nil {
+		return err
 	}
 	return nil
 }
@@ -188,7 +242,10 @@ func (h *Handle) RecvFlow() (FlowEvent, error) {
 		return FlowEvent{}, err
 	}
 	ev := addressEvent(&a)
-	// WINDIVERT_DATA_FLOW starts at offset 16.
+	// WINDIVERT_DATA_FLOW starts at offset 16. Endpoint/ParentEndpoint are
+	// stable WinDivert identifiers for the lifetime of the endpoint.
+	endpointID := binary.LittleEndian.Uint64(a.Raw[16:24])
+	parentEndpointID := binary.LittleEndian.Uint64(a.Raw[24:32])
 	pid := binary.LittleEndian.Uint32(a.Raw[32:36])
 	local, err := formatAddress(a.Raw[36:52])
 	if err != nil {
@@ -204,7 +261,34 @@ func (h *Handle) RecvFlow() (FlowEvent, error) {
 	rp := binary.LittleEndian.Uint16(a.Raw[70:72])
 	proto := a.Raw[72]
 	p := ProcessInfo(pid)
-	return FlowEvent{Event: ev, Key: flow.Key{Proto: proto, Local: local, Remote: remote, LocalPort: lp, RemotePort: rp}, Process: p}, nil
+	return FlowEvent{Event: ev, EndpointID: endpointID, ParentEndpointID: parentEndpointID, Key: flow.Key{Proto: proto, Local: local, Remote: remote, LocalPort: lp, RemotePort: rp}, Process: p}, nil
+}
+
+func (h *Handle) RecvSocket() (SocketEvent, error) {
+	if h.layer != LayerSocket {
+		return SocketEvent{}, errors.New("RecvSocket called on non-SOCKET handle")
+	}
+	_, a, err := h.Recv(nil)
+	if err != nil {
+		return SocketEvent{}, err
+	}
+	ev := addressEvent(&a)
+	endpointID := binary.LittleEndian.Uint64(a.Raw[16:24])
+	parentEndpointID := binary.LittleEndian.Uint64(a.Raw[24:32])
+	pid := binary.LittleEndian.Uint32(a.Raw[32:36])
+	local, err := formatAddress(a.Raw[36:52])
+	if err != nil {
+		return SocketEvent{}, fmt.Errorf("local socket address: %w", err)
+	}
+	remote, err := formatAddress(a.Raw[52:68])
+	if err != nil {
+		return SocketEvent{}, fmt.Errorf("remote socket address: %w", err)
+	}
+	local, remote = local.Unmap(), remote.Unmap()
+	lp := binary.LittleEndian.Uint16(a.Raw[68:70])
+	rp := binary.LittleEndian.Uint16(a.Raw[70:72])
+	proto := a.Raw[72]
+	return SocketEvent{Event: ev, EndpointID: endpointID, ParentEndpointID: parentEndpointID, Key: flow.Key{Proto: proto, Local: local, Remote: remote, LocalPort: lp, RemotePort: rp}, Process: ProcessInfo(pid)}, nil
 }
 
 func formatAddress(raw []byte) (netip.Addr, error) {

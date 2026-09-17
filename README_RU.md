@@ -1,4 +1,7 @@
-# SplitWire 1.2.0
+# SplitWire 1.2.2
+
+SplitWire 1.2.2 объединяет исправления dataplane, process attribution, MTU/fragmentation, WireGuard RX observability, DNS/rules и GUI-логирования после 1.2.1. Исходники проходят unit/race/vet, Windows-amd64 cross-vet/cross-build и независимый WireGuard interoperability smoke test. Ограничение проверки: в этой Linux-среде невозможно загрузить WinDivert и воспроизвести живую Windows-связку с корпоративным VPN, Discord, ChatGPT и YouTube; см. `TEST_RESULTS.txt` и `CHANGELOG_1.2.2.md`.
+
 
 SplitWire — переносимый Windows-клиент для выборочного WireGuard-туннелирования без Wintun/TUN-адаптера и без добавления системных маршрутов Windows.
 
@@ -42,9 +45,19 @@ SplitWire — переносимый Windows-клиент для выбороч�
 - **Подключить / Отключить** — явное управление runtime без Windows Service;
 - блок **Состояние** — physical interface, WireGuard endpoint, последний handshake, hostname/PAC mode, WG TX/RX и основные packet counters;
 - **Группы маршрутизации** — показывает текущие `Apps`, `Domains` и `Networks`;
-- **Лог** — live tail `splitwire.log`; кнопка **«Открыть лог»** открывает файл обычным Windows-приложением, **«Очистить окно»** очищает только UI, не файл.
+- **Лог** — live stream из того же fan-out logger, который пишет `splitwire.log`: логгер одновременно пишет в файл и bounded in-memory UI sink. Файл читается только один раз при старте для истории; дальше UI получает только новые строки из памяти. `PostMessage` используется лишь как coalesced wake-up, а не как транспорт текста. Кнопка **«Открыть лог»** открывает файл обычным Windows-приложением, **«Очистить окно»** очищает только UI, не файл.
 
 UI читает статус непосредственно из того же `engine.Runner`, который маршрутизирует трафик. Отдельного фонового helper/service процесса нет.
+
+
+## Исправления стабильности 1.2.1
+
+1. Периодический WireGuard rekey теперь выполняется в фоне. Текущая рабочая key session продолжает передавать пакеты во время handshake, поэтому голосовой UDP Discord/Telegram не должен зависать на каждом обновлении ключа.
+2. SplitWire больше не сбрасывает неизвестные уже установленные HTTPS/TLS соединения только ради повторного обнаружения SNI. Переподключается только поток, для которого реально распознан hostname, совпавший с правилом.
+3. При работающем PAC агрессивный QUIC->TCP discovery отключён: PAC уже знает hostname до открытия соединения. Он включается только как fallback, если PAC установить не удалось.
+4. Счётчик `discovery` теперь относится к релевантному TCP/UDP:443 трафику, а не почти ко всем пакетам при наличии глобальной доменной группы `Apps = *`.
+
+Строки `WireGuard rekey (non-blocking) ...` в логе являются штатным обновлением ключей, а не разрывом туннеля.
 
 ## WireGuard-конфиг и default config
 
@@ -105,23 +118,28 @@ MTU = 1380
 DNSRefreshSeconds = 60
 
 [Group "Messengers"]
-Apps = Discord.exe, Telegram.exe
+Apps = Discord.exe, DiscordSystemHelper.exe, Telegram.exe
+Domains = *
+
+[Group "ChatGPT desktop"]
+Apps = ChatGPT.exe
 Domains = *
 
 [Group "AI"]
-Apps = chrome.exe, firefox.exe, msedge.exe
-Domains = chatgpt.com, *.chatgpt.com, openai.com, *.openai.com, oaistatic.com, *.oaistatic.com, oaiusercontent.com, *.oaiusercontent.com
+Apps = chrome.exe, firefox.exe, msedge.exe, msedgewebview2.exe
+Domains = chatgpt.com, *.chatgpt.com, openai.com, *.openai.com, *.auth.openai.com, auth0.openai.com, setup.auth.openai.com, oaistatic.com, *.oaistatic.com, oaiusercontent.com, *.oaiusercontent.com, oaistatsig.com, *.oaistatsig.com, *.ct.sendgrid.net, *.intercom.io, *.intercomcdn.com, js.intercomcdn.com, openaimerge.com, *.openaimerge.com, cdn.openaimerge.com, workos.com, *.workos.com, workoscdn.com, *.workoscdn.com, cdn.workos.com, forwarder.workos.com, images.workoscdn.com, setup.workos.com, workos.imgix.net, js.stripe.com, challenges.cloudflare.com, o207216.ingest.sentry.io, o33249.ingest.sentry.io, rum.browser-intake-datadoghq.com, android.chat.openai.com, ios.chat.openai.com, desktop.chat.openai.com, tcr9i.chat.openai.com, featuregates.org, *.featuregates.org, featureassets.org, statsig.com, *.statsig.com, statsigapi.net, *.statsigapi.net
 
 [Group "YouTube"]
 Apps = *
-Domains = youtube.com, *.youtube.com, youtu.be, *.googlevideo.com, *.ytimg.com, youtubei.googleapis.com
+Domains = youtube.com, *.youtube.com, youtu.be, youtube-nocookie.com, *.youtube-nocookie.com, googlevideo.com, *.googlevideo.com, ytimg.com, *.ytimg.com, youtubei.googleapis.com, youtube.googleapis.com, yt3.ggpht.com, *.ggpht.com, jnn-pa.googleapis.com
 ```
 
 Получается:
 
 ```text
-Discord.exe / Telegram.exe + любой адрес       -> WireGuard
-Chrome/Firefox/Edge + ChatGPT/OpenAI hostname -> WireGuard
+Discord/DiscordSystemHelper/Telegram + любой адрес -> WireGuard
+ChatGPT.exe + любой адрес                         -> WireGuard
+Chrome/Firefox/Edge/WebView + OpenAI hostname    -> WireGuard
 любой процесс + YouTube hostname              -> WireGuard
 всё остальное                                 -> DIRECT / корпоративный VPN
 ```
@@ -396,7 +414,7 @@ proxyWG
 ```text
 go test ./...
 go vet ./...
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w -H=windowsgui" ...
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w -H=windowsgui" ...
 ```
 
 Race detector намеренно не запускается по умолчанию: на Windows он требует cgo и установленный C compiler. Для dev-проверки, если подходящий mingw-w64/clang уже установлен:
@@ -412,7 +430,8 @@ SplitWire.exe
 splitwire.default.conf
 README_RU.md
 THIRD_PARTY_NOTICES.md
-CHANGELOG_1.2.0.md
+CHANGELOG_1.2.2.md
+TEST_RESULTS.txt
 remove-windivert-driver.ps1
 ```
 

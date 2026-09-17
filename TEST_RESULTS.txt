@@ -1,61 +1,57 @@
-SplitWire 1.2.0 UI validation
-Date: 2026-08-21
+SplitWire 1.2.2 validation
+Date: 2026-09-14
 
-Host validation environment:
+Validation environment:
 - Linux amd64
-- Go 1.23+
+- Go 1.23.2
+- Python cryptography 46.0.4 (independent WireGuard responder)
 
-1) Unit / integration tests
-Command:
-  go test ./...
+1) Diff hygiene
+  git diff --check
 Result: PASS
 
-New 1.2.0 coverage includes:
-- app.Inspect default-rules resolution
-- last-config save/load
-- existing routing/config/domain/proxy/NAT/WireGuard tests from 1.1.1
+2) Unit / integration tests
+  go test -count=1 ./...
+Result: PASS
 
-2) Static analysis
-Command:
+Coverage relevant to 1.2.2 includes:
+- fan-out file + bounded incremental UI log sink;
+- SOCKET EndpointId ownership, wildcard bind attribution and stale-port reuse cases;
+- sticky per-flow routing and pre-existing TCP reconnect handling;
+- WireGuard DNS parsing / tunneled hostname resolution;
+- TCP MSS clamp and Windows LSO software segmentation;
+- IPv4/IPv6 fragmentation + bounded reassembly, re-fragmentation and timeout accounting;
+- non-blocking WireGuard plaintext queue diagnostics;
+- existing NAT, DNS/SNI, policy and WireGuard crypto regressions.
+
+3) Static analysis
   go vet ./...
 Result: PASS
 
-3) Race detector
-Command:
-  go test -race ./...
+4) Race detector
+  go test -race -count=1 ./...
 Result: PASS
 
-4) Windows-specific vet
-Command:
-  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/splitwire ./internal/app
+5) Windows-specific static analysis
+  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
 Result: PASS
 
-5) Native Windows GUI cross-build
-Command:
-  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags '-s -w -H=windowsgui' -o SplitWire.exe ./cmd/splitwire
+6) Windows x64 GUI cross-build
+  GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags '-s -w -H=windowsgui' -o SplitWire.exe ./cmd/splitwire
 Result: PASS
 
 Binary identification:
   PE32+ executable for MS Windows 6.01 (GUI), x86-64, 8 sections
 
 SHA-256 SplitWire.exe:
-  8c073c29e36ca66929b9e77325c998750482ccc3f486a0105fe6c550f0142afd
+  d79c1cc6c681a99e4d1b1854328502a71927534862be104721fb5fb77ced6ffd
 
-6) Independent WireGuard interoperability smoke test
+7) Independent WireGuard interoperability smoke test
 Python responder: cryptography X25519 + ChaCha20-Poly1305
-Go initiator: SplitWire WireGuard implementation
+Go initiator: SplitWire custom WireGuard implementation
 Result:
   GO_WIREGUARD_INTEROP_OK
   PY_WIREGUARD_INTEROP_OK
 
-7) Policy scaling microbenchmark
-Command:
-  go test ./internal/policy -run '^$' -bench BenchmarkDecideIndexedGroups -benchmem -count=1
-
-Observed on this VM (AMD EPYC 9V74; Linux; policy-only, not WinDivert/WireGuard end-to-end):
-- 3 groups:   ~242.8 ns/op, 32 B/op, 2 allocs/op
-- 50 groups:  ~251.7 ns/op, 32 B/op, 2 allocs/op
-- 500 groups: ~250.6 ns/op, 32 B/op, 2 allocs/op
-
-Important validation boundary:
-The native Win32 UI was cross-compiled and vetted, but this environment is Linux and cannot visually run the Windows window, load the WinDivert kernel driver, or perform a real Windows + corporate VPN end-to-end test. Runtime routing code itself was not replaced; 1.2.0 moves lifecycle management into internal/app and wraps the existing engine with a native GUI.
+Validation boundary:
+The Windows-specific code was cross-built and vetted from Linux. This environment cannot load WinDivert or reproduce the user's live Windows + corporate VPN + Discord/ChatGPT/YouTube environment. Code/build validation is complete, but live end-to-end Windows validation must still be done on a Windows machine.

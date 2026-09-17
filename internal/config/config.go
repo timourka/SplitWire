@@ -29,6 +29,7 @@ type Group struct {
 type Config struct {
 	PrivateKey        string
 	Addresses         []netip.Prefix
+	DNSServers        []netip.Addr
 	Peer              Peer
 	Groups            []Group
 	PhysicalInterface string
@@ -208,6 +209,15 @@ func parseInto(s *bufio.Scanner, cfg *Config, allowWireGuard bool) error {
 						return fmt.Errorf("line %d: Address %q: %w", lineNo, p, err)
 					}
 					cfg.Addresses = append(cfg.Addresses, pr)
+				}
+			case "dns":
+				// WireGuard clients also allow DNS search-domain tokens here. SplitWire
+				// intentionally keeps only literal resolver IPs; it never changes the
+				// machine-wide Windows DNS configuration.
+				for _, x := range splitList(v) {
+					if a, err := netip.ParseAddr(strings.TrimSpace(x)); err == nil {
+						cfg.DNSServers = append(cfg.DNSServers, a.Unmap())
+					}
 				}
 			}
 		case sectionPeer:

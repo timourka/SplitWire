@@ -3,6 +3,7 @@ package browserproxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -129,7 +130,7 @@ func (s *Server) PAC() string {
 	if len(cond) > 0 {
 		expr = strings.Join(cond, " || ")
 	}
-	return fmt.Sprintf("function FindProxyForURL(url, host) { var h=(host||'').toLowerCase(); if (%s) return 'PROXY %s; DIRECT'; return 'DIRECT'; }\n", expr, s.Addr())
+	return fmt.Sprintf("function FindProxyForURL(url, host) { var h=(host||'').toLowerCase(); if (%s) return 'PROXY %s'; return 'DIRECT'; }\n", expr, s.Addr())
 }
 
 func jsQuote(s string) string {
@@ -210,29 +211,43 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		up.Close()
 		return
 	}
-	go bridge(client, up)
+	go s.bridge(host, client, up)
 }
 
-func bridge(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+func (s *Server) bridge(host string, client, upstream net.Conn) {
+	type result struct {
+		dir string
+		n   int64
+		err error
+	}
+	ch := make(chan result, 2)
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(a, b)
-		if x, ok := a.(*net.TCPConn); ok {
+		n, err := io.Copy(upstream, client)
+		if x, ok := upstream.(*net.TCPConn); ok {
 			_ = x.CloseWrite()
 		}
+		ch <- result{"up", n, err}
 	}()
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(b, a)
-		if x, ok := b.(*net.TCPConn); ok {
+		n, err := io.Copy(client, upstream)
+		if x, ok := client.(*net.TCPConn); ok {
 			_ = x.CloseWrite()
 		}
+		ch <- result{"down", n, err}
 	}()
-	wg.Wait()
-	_ = a.Close()
-	_ = b.Close()
+	r1 := <-ch
+	if r1.err != nil {
+		_ = client.Close()
+		_ = upstream.Close()
+	}
+	r2 := <-ch
+	_ = client.Close()
+	_ = upstream.Close()
+	for _, r := range []result{r1, r2} {
+		if r.err != nil && !errors.Is(r.err, net.ErrClosed) {
+			s.logLimited("bridge|"+host+"|"+r.dir+"|"+r.err.Error(), 5*time.Second, "hostname proxy stream %s %s failed after %d bytes: %v", host, r.dir, r.n, r.err)
+		}
+	}
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {

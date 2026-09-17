@@ -119,3 +119,14 @@ func TestProxyPatternsExcludeCatchAll(t *testing.T) {
 		t.Fatal("expected hostname patterns")
 	}
 }
+
+func TestWireGuardDNSServersParsedWithoutSearchDomains(t *testing.T) {
+	wg := strings.Replace(testWG, "Address = 10.66.66.20/32", "Address = 10.66.66.20/32\nDNS = 1.1.1.1, 1.0.0.1, corp.example", 1)
+	cfg, err := LoadFromData([]byte(wg), []byte(testDefaults))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.DNSServers) != 2 || cfg.DNSServers[0].String() != "1.1.1.1" || cfg.DNSServers[1].String() != "1.0.0.1" {
+		t.Fatalf("DNS=%v", cfg.DNSServers)
+	}
+}

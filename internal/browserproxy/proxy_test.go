@@ -21,6 +21,9 @@ func TestPAC(t *testing.T) {
 	if !strings.Contains(pac, "chatgpt.com") || !strings.Contains(pac, ".googlevideo.com") || !strings.Contains(pac, s.Addr()) {
 		t.Fatalf("bad PAC: %s", pac)
 	}
+	if strings.Contains(pac, "PROXY "+s.Addr()+"; DIRECT") {
+		t.Fatalf("selected hosts must not silently escape DIRECT: %s", pac)
+	}
 	got, err := ProbePAC(s.PACURL())
 	if err != nil {
 		t.Fatal(err)

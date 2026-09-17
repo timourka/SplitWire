@@ -37,9 +37,10 @@ const (
 	wmSetFont = 0x0030
 	wmApp     = 0x8000
 
-	emSetSel      = 0x00B1
-	emScrollCaret = 0x00B7
-	emReplaceSel  = 0x00C2
+	emSetSel       = 0x00B1
+	emScrollCaret  = 0x00B7
+	emReplaceSel   = 0x00C2
+	emSetLimitText = 0x00C5
 
 	mbOK        = 0x00000000
 	mbIconError = 0x00000010
@@ -231,6 +232,30 @@ func sendMessage(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 
 func setText(hwnd uintptr, s string) {
 	procSetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(utf16Ptr(s))))
+}
+
+func textLength(hwnd uintptr) int {
+	n, _, _ := procGetWindowTextLenW.Call(hwnd)
+	return int(n)
+}
+
+func setEditLimit(hwnd uintptr, n int) {
+	if n < 0 {
+		n = 0
+	}
+	sendMessage(hwnd, emSetLimitText, uintptr(n), 0)
+}
+
+// appendEditText is called only on the GUI thread. Log producers never pass
+// text through PostMessage; wmAppLog is merely a coalesced wake-up and the UI
+// drains the in-memory log sink itself.
+func appendEditText(hwnd uintptr, s string) {
+	if hwnd == 0 || s == "" {
+		return
+	}
+	n := textLength(hwnd)
+	sendMessage(hwnd, emSetSel, uintptr(n), uintptr(n))
+	sendMessage(hwnd, emReplaceSel, 0, uintptr(unsafe.Pointer(utf16Ptr(s))))
 }
 
 func getText(hwnd uintptr) string {

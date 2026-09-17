@@ -67,10 +67,10 @@ type mibUDP6RowOwnerPID struct {
 	OwningPID    uint32
 }
 
-// SnapshotExisting adds ownership information for endpoints that existed
-// before the WinDivert FLOW handle was opened. resolve is called at most once
-// for each PID during this snapshot. It returns the number of TCP connections
-// and UDP endpoints imported.
+// SnapshotExisting replaces the lower-priority IP Helper fallback with a
+// current point-in-time snapshot. WinDivert FLOW/SOCKET events remain live and
+// higher priority. Building into a temporary Index avoids a window where a
+// refresh first clears old fallback state and only then repopulates it.
 func (i *Index) SnapshotExisting(resolve func(uint32) Process) (tcpCount, udpCount int, err error) {
 	if resolve == nil {
 		resolve = func(pid uint32) Process { return Process{PID: pid} }
@@ -88,27 +88,37 @@ func (i *Index) SnapshotExisting(resolve func(uint32) Process) (tcpCount, udpCou
 		return p
 	}
 
+	// Collect into isolated fallback maps. If one address family cannot be read,
+	// the successful families still replace the snapshot; keeping an arbitrary
+	// stale PID/port mapping is more dangerous than temporarily having no fallback.
+	tmp := New()
 	var errs []error
-	if n, e := i.snapshotTCP4(owner); e != nil {
+	if n, e := tmp.snapshotTCP4(owner); e != nil {
 		errs = append(errs, fmt.Errorf("TCP/IPv4: %w", e))
 	} else {
 		tcpCount += n
 	}
-	if n, e := i.snapshotTCP6(owner); e != nil {
+	if n, e := tmp.snapshotTCP6(owner); e != nil {
 		errs = append(errs, fmt.Errorf("TCP/IPv6: %w", e))
 	} else {
 		tcpCount += n
 	}
-	if n, e := i.snapshotUDP4(owner); e != nil {
+	if n, e := tmp.snapshotUDP4(owner); e != nil {
 		errs = append(errs, fmt.Errorf("UDP/IPv4: %w", e))
 	} else {
 		udpCount += n
 	}
-	if n, e := i.snapshotUDP6(owner); e != nil {
+	if n, e := tmp.snapshotUDP6(owner); e != nil {
 		errs = append(errs, fmt.Errorf("UDP/IPv6: %w", e))
 	} else {
 		udpCount += n
 	}
+
+	i.mu.Lock()
+	i.snapshotExact = tmp.snapshotExact
+	i.locals = tmp.locals
+	i.mu.Unlock()
+	i.signal()
 	return tcpCount, udpCount, errors.Join(errs...)
 }
 
@@ -192,7 +202,7 @@ func (i *Index) snapshotTCP4(owner func(uint32) Process) (int, error) {
 		if lp == 0 || rp == 0 || remote.IsUnspecified() {
 			continue
 		}
-		i.Add(Key{Proto: 6, Local: local, Remote: remote, LocalPort: lp, RemotePort: rp}, owner(r.OwningPID))
+		i.AddSnapshotExact(Key{Proto: 6, Local: local, Remote: remote, LocalPort: lp, RemotePort: rp}, owner(r.OwningPID))
 		n++
 	}
 	return n, nil
@@ -218,7 +228,7 @@ func (i *Index) snapshotTCP6(owner func(uint32) Process) (int, error) {
 		if lp == 0 || rp == 0 || remote.IsUnspecified() {
 			continue
 		}
-		i.Add(Key{Proto: 6, Local: local, Remote: remote, LocalPort: lp, RemotePort: rp}, owner(r.OwningPID))
+		i.AddSnapshotExact(Key{Proto: 6, Local: local, Remote: remote, LocalPort: lp, RemotePort: rp}, owner(r.OwningPID))
 		n++
 	}
 	return n, nil
@@ -303,7 +313,9 @@ func (i *Index) ResolveSocketOwner(k Key, resolve func(uint32) Process) (Process
 	if p.PID == 0 {
 		p.PID = pid
 	}
-	i.Add(k, p)
+	// Do not create a durable ownership entry from this one-shot fallback. The
+	// caller makes the route sticky immediately; live FLOW/SOCKET events own
+	// lifecycle state and cannot then be shadowed by a stale IP Helper answer.
 	return p, true
 }
 

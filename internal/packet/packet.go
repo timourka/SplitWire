@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync/atomic"
 )
 
 const (
@@ -45,7 +46,7 @@ func parse4(b []byte) (Packet, error) {
 		return Packet{}, errors.New("bad ipv4 ihl")
 	}
 	frag := binary.BigEndian.Uint16(b[6:8])
-	if frag&0x1fff != 0 {
+	if frag&0x3fff != 0 { // MF or non-zero fragment offset
 		return Packet{}, ErrFragment
 	}
 	total := int(binary.BigEndian.Uint16(b[2:4]))
@@ -63,8 +64,9 @@ func parse6(b []byte) (Packet, error) {
 	var s, d [16]byte
 	copy(s[:], b[8:24])
 	copy(d[:], b[24:40])
-	total := 40 + int(binary.BigEndian.Uint16(b[4:6]))
-	if total > len(b) || total < 40 {
+	plen := int(binary.BigEndian.Uint16(b[4:6]))
+	total := 40 + plen
+	if (plen == 0 && len(b) > 40) || total > len(b) || total < 40 {
 		total = len(b)
 	}
 	next := b[6]
@@ -340,4 +342,377 @@ func BuildTCPResetReply(outbound []byte) ([]byte, error) {
 		return b, nil
 	}
 	return nil, errors.New("unsupported IP version")
+}
+
+// IsTCPSYN reports whether b is a TCP SYN (with or without ACK).
+func IsTCPSYN(b []byte) bool {
+	p, err := Parse(b)
+	return err == nil && p.Protocol == ProtoTCP && p.L4+14 <= p.Total && b[p.L4+13]&0x02 != 0
+}
+
+// SplitForMTU turns a Windows outbound TCP LSO packet into ordinary IP/TCP
+// packets no larger than mtu. Ordinary packets are returned unchanged. UDP is
+// intentionally not byte-sliced here: IP fragmentation has different semantics
+// and oversize UDP is rejected by the WireGuard layer instead of being silently
+// emitted as an oversize outer datagram.
+func SplitForMTU(b []byte, mtu int) ([][]byte, bool, error) {
+	if mtu < 576 {
+		return nil, false, fmt.Errorf("bad MTU %d", mtu)
+	}
+	if len(b) <= mtu {
+		return [][]byte{append([]byte(nil), b...)}, false, nil
+	}
+	p, err := Parse(b)
+	if err != nil {
+		return nil, false, err
+	}
+	if p.Protocol != ProtoTCP {
+		return nil, false, fmt.Errorf("oversize non-TCP inner packet: %d > MTU %d", len(b), mtu)
+	}
+	// WinDivert NETWORK can expose an outbound LSO super-packet before the NIC
+	// performs hardware segmentation. In that case the IP payload-length field
+	// may describe only a normal segment (or be zero for IPv6) while Recv() has
+	// returned the whole super-packet. The WinDivert packet length is authoritative
+	// for the captured LSO template.
+	p.Total = len(b)
+	if p.L4+20 > len(b) {
+		return nil, false, errors.New("short TCP LSO packet")
+	}
+	tcpHL := int(b[p.L4+12]>>4) * 4
+	if tcpHL < 20 || p.L4+tcpHL > len(b) {
+		return nil, false, errors.New("bad TCP header in LSO packet")
+	}
+	maxPayload := mtu - p.L4 - tcpHL
+	if maxPayload <= 0 {
+		return nil, false, fmt.Errorf("MTU %d too small for headers %d", mtu, p.L4+tcpHL)
+	}
+	payload := b[p.L4+tcpHL:]
+	if len(payload) == 0 {
+		return nil, false, fmt.Errorf("oversize TCP packet without payload: %d", len(b))
+	}
+	baseSeq := binary.BigEndian.Uint32(b[p.L4+4 : p.L4+8])
+	origFlags := b[p.L4+13]
+	// SYN consumes sequence space and is not an LSO data template in normal use.
+	if origFlags&0x02 != 0 {
+		return nil, false, errors.New("oversize TCP SYN cannot be segmented")
+	}
+	out := make([][]byte, 0, (len(payload)+maxPayload-1)/maxPayload)
+	for off := 0; off < len(payload); off += maxPayload {
+		end := off + maxPayload
+		if end > len(payload) {
+			end = len(payload)
+		}
+		seg := make([]byte, p.L4+tcpHL+(end-off))
+		copy(seg, b[:p.L4+tcpHL])
+		copy(seg[p.L4+tcpHL:], payload[off:end])
+		binary.BigEndian.PutUint32(seg[p.L4+4:p.L4+8], baseSeq+uint32(off))
+		flags := origFlags
+		if end != len(payload) {
+			flags &^= 0x01 | 0x08 | 0x80
+		} // FIN, PSH, CWR only on last
+		seg[p.L4+13] = flags
+		// Checksums are recalculated after NAT/segmentation by the engine.
+		seg[p.L4+16], seg[p.L4+17] = 0, 0
+		if p.Version == 4 {
+			if len(seg) > 65535 {
+				return nil, false, errors.New("segmented IPv4 packet still too large")
+			}
+			binary.BigEndian.PutUint16(seg[2:4], uint16(len(seg)))
+			seg[10], seg[11] = 0, 0
+		} else {
+			plen := len(seg) - 40
+			if plen > 65535 {
+				return nil, false, errors.New("segmented IPv6 payload still too large")
+			}
+			binary.BigEndian.PutUint16(seg[4:6], uint16(plen))
+		}
+		out = append(out, seg)
+	}
+	return out, true, nil
+}
+
+// IsFragment reports whether b carries an IPv4 fragment (MF or non-zero
+// offset) or an IPv6 Fragment extension header.
+func IsFragment(b []byte) bool {
+	if len(b) < 1 {
+		return false
+	}
+	switch b[0] >> 4 {
+	case 4:
+		if len(b) < 8 {
+			return false
+		}
+		return binary.BigEndian.Uint16(b[6:8])&0x3fff != 0
+	case 6:
+		_, _, _, found, _ := ipv6FragmentPoint(b)
+		return found
+	default:
+		return false
+	}
+}
+
+var fragmentID uint32
+
+// FragmentForMTU fragments a complete IP datagram to mtu. It is intended for
+// UDP/non-LSO traffic after transport checksums/NAT are finalized. TCP LSO must
+// use SplitForMTU instead so TCP sequence numbers are corrected per segment.
+func FragmentForMTU(b []byte, mtu int) ([][]byte, bool, error) {
+	if mtu < 576 {
+		return nil, false, fmt.Errorf("bad MTU %d", mtu)
+	}
+	if len(b) <= mtu {
+		return [][]byte{append([]byte(nil), b...)}, false, nil
+	}
+	if len(b) < 1 {
+		return nil, false, errors.New("empty IP packet")
+	}
+	switch b[0] >> 4 {
+	case 4:
+		return fragmentIPv4(b, mtu)
+	case 6:
+		return fragmentIPv6(b, mtu)
+	default:
+		return nil, false, errors.New("not IP")
+	}
+}
+
+func fragmentIPv4(b []byte, mtu int) ([][]byte, bool, error) {
+	if len(b) < 20 {
+		return nil, false, errors.New("short ipv4")
+	}
+	ihl := int(b[0]&0x0f) * 4
+	if ihl < 20 || ihl > len(b) {
+		return nil, false, errors.New("bad ipv4 ihl")
+	}
+	total := int(binary.BigEndian.Uint16(b[2:4]))
+	if total == 0 || total > len(b) {
+		total = len(b)
+	}
+	if total <= mtu {
+		return [][]byte{append([]byte(nil), b[:total]...)}, false, nil
+	}
+	fv := binary.BigEndian.Uint16(b[6:8])
+	if fv&0x3fff != 0 {
+		return nil, false, errors.New("IPv4 packet is already fragmented")
+	}
+	if fv&0x4000 != 0 {
+		return nil, false, fmt.Errorf("IPv4 DF packet %d exceeds MTU %d", total, mtu)
+	}
+	maxPayload := ((mtu - ihl) / 8) * 8
+	if maxPayload < 8 {
+		return nil, false, fmt.Errorf("MTU %d too small for IPv4 header %d", mtu, ihl)
+	}
+	payload := b[ihl:total]
+	id := binary.BigEndian.Uint16(b[4:6])
+	if id == 0 {
+		id = uint16(atomic.AddUint32(&fragmentID, 1))
+		if id == 0 {
+			id = uint16(atomic.AddUint32(&fragmentID, 1))
+		}
+	}
+	reserved := fv & 0x8000
+	out := make([][]byte, 0, (len(payload)+maxPayload-1)/maxPayload)
+	for off := 0; off < len(payload); {
+		n := len(payload) - off
+		more := n > maxPayload
+		if more {
+			n = maxPayload
+		}
+		frag := make([]byte, ihl+n)
+		copy(frag, b[:ihl])
+		copy(frag[ihl:], payload[off:off+n])
+		binary.BigEndian.PutUint16(frag[2:4], uint16(len(frag)))
+		binary.BigEndian.PutUint16(frag[4:6], id)
+		flagsOff := reserved | uint16(off/8)
+		if more {
+			flagsOff |= 0x2000
+		}
+		binary.BigEndian.PutUint16(frag[6:8], flagsOff)
+		frag[10], frag[11] = 0, 0
+		binary.BigEndian.PutUint16(frag[10:12], ipv4HeaderChecksum(frag[:ihl]))
+		out = append(out, frag)
+		off += n
+	}
+	return out, true, nil
+}
+
+func ipv4HeaderChecksum(h []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(h); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(h[i : i+2]))
+	}
+	if len(h)%2 != 0 {
+		sum += uint32(h[len(h)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+// ipv6FragmentPoint walks the unfragmentable extension chain. insert is the
+// byte offset where a Fragment header is/should be placed, prevNext is the byte
+// containing the Next Header value that points at insert, and next is the upper
+// header currently referenced there. found is true when a Fragment header is
+// already present.
+func ipv6FragmentPoint(b []byte) (insert, prevNext int, next uint8, found bool, err error) {
+	if len(b) < 40 || b[0]>>4 != 6 {
+		return 0, 0, 0, false, errors.New("short/non-IPv6 packet")
+	}
+	total := 40 + int(binary.BigEndian.Uint16(b[4:6]))
+	if total < 40 || total > len(b) {
+		total = len(b)
+	}
+	next = b[6]
+	prevNext = 6
+	off := 40
+	for {
+		switch next {
+		case 0, 43, 60: // Hop-by-Hop, Routing, Destination Options
+			if off+2 > total {
+				return 0, 0, 0, false, errors.New("short ipv6 extension")
+			}
+			n := (int(b[off+1]) + 1) * 8
+			if n < 8 || off+n > total {
+				return 0, 0, 0, false, errors.New("bad ipv6 extension")
+			}
+			prevNext = off
+			next = b[off]
+			off += n
+		case 51: // AH
+			if off+2 > total {
+				return 0, 0, 0, false, errors.New("short ah")
+			}
+			n := (int(b[off+1]) + 2) * 4
+			if n < 8 || off+n > total {
+				return 0, 0, 0, false, errors.New("bad ah")
+			}
+			prevNext = off
+			next = b[off]
+			off += n
+		case 44:
+			if off+8 > total {
+				// Preserve found=true so callers can fail closed instead of
+				// treating a malformed fragment as ordinary DIRECT traffic.
+				return off, prevNext, next, true, errors.New("short ipv6 fragment header")
+			}
+			return off, prevNext, next, true, nil
+		default:
+			return off, prevNext, next, false, nil
+		}
+	}
+}
+
+// ipv6FragmentInsertPoint returns the standards-compliant position for a new
+// Fragment header. Per RFC 8200, Hop-by-Hop and the routing portion are
+// unfragmentable; AH and final-destination options belong after Fragment.
+func ipv6FragmentInsertPoint(b []byte) (insert, prevNext int, next uint8, err error) {
+	if len(b) < 40 || b[0]>>4 != 6 {
+		return 0, 0, 0, errors.New("short/non-IPv6 packet")
+	}
+	total := 40 + int(binary.BigEndian.Uint16(b[4:6]))
+	if total < 40 || total > len(b) {
+		return 0, 0, 0, errors.New("truncated IPv6 packet")
+	}
+	next = b[6]
+	prevNext = 6
+	off := 40
+	for {
+		switch next {
+		case 0, 43: // Hop-by-Hop, Routing: part of the unfragmentable chain.
+			if off+2 > total {
+				return 0, 0, 0, errors.New("short IPv6 extension")
+			}
+			n := (int(b[off+1]) + 1) * 8
+			if n < 8 || off+n > total {
+				return 0, 0, 0, errors.New("bad IPv6 extension")
+			}
+			prevNext = off
+			next = b[off]
+			off += n
+		case 60: // Destination Options is unfragmentable only before Routing.
+			if off+2 > total {
+				return 0, 0, 0, errors.New("short IPv6 destination options")
+			}
+			n := (int(b[off+1]) + 1) * 8
+			if n < 8 || off+n > total {
+				return 0, 0, 0, errors.New("bad IPv6 destination options")
+			}
+			if b[off] != 43 {
+				return off, prevNext, next, nil
+			}
+			prevNext = off
+			next = b[off]
+			off += n
+		case 44:
+			return 0, 0, 0, errors.New("IPv6 packet is already fragmented")
+		default:
+			// AH/ESP/final Destination Options/upper-layer data are fragmentable.
+			return off, prevNext, next, nil
+		}
+	}
+}
+
+func fragmentIPv6(b []byte, mtu int) ([][]byte, bool, error) {
+	if len(b) < 40 {
+		return nil, false, errors.New("short ipv6")
+	}
+	plen := int(binary.BigEndian.Uint16(b[4:6]))
+	if plen == 0 {
+		return nil, false, errors.New("IPv6 jumbogram fragmentation is unsupported")
+	}
+	total := 40 + plen
+	if total > len(b) {
+		return nil, false, errors.New("truncated ipv6 packet")
+	}
+	if total <= mtu {
+		return [][]byte{append([]byte(nil), b[:total]...)}, false, nil
+	}
+	_, _, _, found, err := ipv6FragmentPoint(b[:total])
+	if err != nil {
+		return nil, false, err
+	}
+	if found {
+		return nil, false, errors.New("IPv6 packet is already fragmented")
+	}
+	insert, prevNext, next, err := ipv6FragmentInsertPoint(b[:total])
+	if err != nil {
+		return nil, false, err
+	}
+	maxPayload := ((mtu - insert - 8) / 8) * 8
+	if maxPayload < 8 {
+		return nil, false, fmt.Errorf("MTU %d too small for IPv6 headers %d", mtu, insert+8)
+	}
+	payload := b[insert:total]
+	id := atomic.AddUint32(&fragmentID, 1)
+	if id == 0 {
+		id = atomic.AddUint32(&fragmentID, 1)
+	}
+	out := make([][]byte, 0, (len(payload)+maxPayload-1)/maxPayload)
+	for off := 0; off < len(payload); {
+		n := len(payload) - off
+		more := n > maxPayload
+		if more {
+			n = maxPayload
+		}
+		frag := make([]byte, insert+8+n)
+		copy(frag, b[:insert])
+		frag[prevNext] = 44
+		frag[insert] = next
+		// frag[insert+1] is reserved zero.
+		v := uint16((off / 8) << 3)
+		if more {
+			v |= 1
+		}
+		binary.BigEndian.PutUint16(frag[insert+2:insert+4], v)
+		binary.BigEndian.PutUint32(frag[insert+4:insert+8], id)
+		copy(frag[insert+8:], payload[off:off+n])
+		if len(frag)-40 > 65535 {
+			return nil, false, errors.New("fragmented IPv6 payload exceeds 65535")
+		}
+		binary.BigEndian.PutUint16(frag[4:6], uint16(len(frag)-40))
+		out = append(out, frag)
+		off += n
+	}
+	return out, true, nil
 }

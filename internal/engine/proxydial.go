@@ -9,36 +9,69 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-// dialProxyRegistered preselects an ephemeral source port, registers the route
-// from ControlContext, and lets net.Dialer perform the actual bind exactly once.
-//
-// The ordering matters on Windows. Go's TCP implementation uses ConnectEx and
-// ControlContext is called before net binds Dialer.LocalAddr:
-//
-//	reserve source port -> ControlContext/register -> net bind -> SYN
-//
-// SplitWire 1.1.0 incorrectly called syscall.Bind from ControlContext and Go
-// then attempted its own bind, producing WSAEINVAL ("An invalid argument was
-// supplied"). This helper never binds from ControlContext.
-func dialProxyRegistered(ctx context.Context, network, address string, tunnel bool, routes *proxyRouteTable) (net.Conn, error) {
+type registeredConn struct {
+	net.Conn
+	routes *proxyRouteTable
+	keys   []proxyRouteKey
+}
+
+func (c *registeredConn) Close() error {
+	if c.routes != nil {
+		for _, k := range c.keys {
+			c.routes.DeleteKey(k)
+		}
+	}
+	return c.Conn.Close()
+}
+
+// registeredPacketConn preserves net.PacketConn when the underlying socket is
+// UDP. net.Resolver uses this interface to decide whether DNS messages need
+// datagram framing or the two-byte DNS-over-TCP length prefix. Hiding the
+// interface makes Go send TCP-framed DNS bytes over UDP and causes timeouts.
+type registeredPacketConn struct {
+	*registeredConn
+	packet net.PacketConn
+}
+
+func (c *registeredPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	return c.packet.ReadFrom(p)
+}
+
+func (c *registeredPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return c.packet.WriteTo(p, addr)
+}
+
+// dialProxyRegistered registers the selected route before connect() emits the
+// first packet. resolver, when non-nil, is used to resolve target hostnames.
+func dialProxyRegistered(ctx context.Context, network, address string, tunnel bool, routes *proxyRouteTable, resolver *net.Resolver) (net.Conn, error) {
+	proto := uint8(6)
+	isUDP := strings.HasPrefix(network, "udp")
+	if isUDP {
+		proto = 17
+	} else if !strings.HasPrefix(network, "tcp") {
+		return nil, fmt.Errorf("unsupported proxy network %q", network)
+	}
 	const attempts = 4
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		localPort, err := reserveTCPSourcePort()
+		localPort, err := reserveSourcePort(network)
 		if err != nil {
 			return nil, fmt.Errorf("reserve proxy source port: %w", err)
 		}
-
-		d := &net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-			LocalAddr: &net.TCPAddr{Port: localPort},
+		d := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second, Resolver: resolver}
+		if isUDP {
+			d.LocalAddr = &net.UDPAddr{Port: localPort}
+		} else {
+			d.LocalAddr = &net.TCPAddr{Port: localPort}
 		}
-		var registered proxyRouteKey
+		var regMu sync.Mutex
+		var registered []proxyRouteKey
 		d.ControlContext = func(_ context.Context, _ string, dialAddress string, _ syscall.RawConn) error {
 			host, portText, err := net.SplitHostPort(dialAddress)
 			if err != nil {
@@ -46,30 +79,32 @@ func dialProxyRegistered(ctx context.Context, network, address string, tunnel bo
 			}
 			ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
 			if err != nil {
-				return fmt.Errorf("proxy dial address %q was not resolved to an IP: %w", dialAddress, err)
+				return fmt.Errorf("dial address %q not resolved to IP: %w", dialAddress, err)
 			}
 			port64, err := strconv.ParseUint(portText, 10, 16)
 			if err != nil || port64 == 0 {
-				return fmt.Errorf("proxy dial invalid remote port %q", portText)
+				return fmt.Errorf("bad remote port %q", portText)
 			}
-			registered = proxyRouteKey{
-				Proto:      6,
-				LocalPort:  uint16(localPort),
-				Remote:     ip.Unmap(),
-				RemotePort: uint16(port64),
-			}
-			// Registration only. net.Dialer binds LocalAddr immediately after the
-			// control hook, before connect/ConnectEx can emit the SYN.
-			routes.Set(registered, tunnel)
+			k := proxyRouteKey{Proto: proto, LocalPort: uint16(localPort), Remote: ip.Unmap(), RemotePort: uint16(port64)}
+			routes.Set(k, tunnel)
+			regMu.Lock()
+			registered = append(registered, k)
+			regMu.Unlock()
 			return nil
 		}
-
 		c, err := d.DialContext(ctx, network, address)
+		regMu.Lock()
+		keys := append([]proxyRouteKey(nil), registered...)
+		regMu.Unlock()
 		if err == nil {
-			return c, nil
+			rc := &registeredConn{Conn: c, routes: routes, keys: keys}
+			if pc, ok := c.(net.PacketConn); ok {
+				return &registeredPacketConn{registeredConn: rc, packet: pc}, nil
+			}
+			return rc, nil
 		}
-		if registered.LocalPort != 0 {
-			routes.DeleteKey(registered)
+		for _, k := range keys {
+			routes.DeleteKey(k)
 		}
 		lastErr = err
 		if !isBindError(err) {
@@ -79,25 +114,61 @@ func dialProxyRegistered(ctx context.Context, network, address string, tunnel bo
 	return nil, lastErr
 }
 
-func reserveTCPSourcePort() (int, error) {
-	// Ask the OS for an unused ephemeral port. An unconnected listener does not
-	// create TIME_WAIT when closed. There is still a tiny race until DialContext
-	// binds the port, so bind failures are retried above.
-	ln, err := net.ListenTCP("tcp", &net.TCPAddr{Port: 0})
+func reserveSourcePort(network string) (int, error) {
+	if strings.HasPrefix(network, "udp") {
+		c, err := net.ListenUDP(network, &net.UDPAddr{Port: 0})
+		if err != nil {
+			return 0, err
+		}
+		p := c.LocalAddr().(*net.UDPAddr).Port
+		err = c.Close()
+		return p, err
+	}
+	ln, err := net.ListenTCP(network, &net.TCPAddr{Port: 0})
 	if err != nil {
 		return 0, err
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
-		return 0, err
-	}
-	if port <= 0 || port > 65535 {
-		return 0, fmt.Errorf("invalid reserved source port %d", port)
-	}
-	return port, nil
+	p := ln.Addr().(*net.TCPAddr).Port
+	err = ln.Close()
+	return p, err
 }
 
 func isBindError(err error) bool {
 	var se *os.SyscallError
 	return errors.As(err, &se) && strings.EqualFold(se.Syscall, "bind")
+}
+
+// newTunnelDNSResolver resolves only SplitWire's own tunneled proxy/bootstrap
+// hostnames through DNS servers declared in the WireGuard config. It does not
+// touch the machine-wide Windows DNS settings.
+func newTunnelDNSResolver(servers []netip.Addr, routes *proxyRouteTable) *net.Resolver {
+	if len(servers) == 0 {
+		return nil
+	}
+	var n atomic.Uint64
+	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		i := int((n.Add(1) - 1) % uint64(len(servers)))
+		server := servers[i]
+		isTCP := strings.HasPrefix(network, "tcp")
+		if server.Is4() {
+			if isTCP {
+				network = "tcp4"
+			} else {
+				network = "udp4"
+			}
+		} else {
+			if isTCP {
+				network = "tcp6"
+			} else {
+				network = "udp6"
+			}
+		}
+		a := net.JoinHostPort(server.String(), "53")
+		return dialProxyRegistered(ctx, network, a, true, routes, nil)
+	}}
+}
+
+func isDNSLookupError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
 }

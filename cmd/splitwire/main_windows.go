@@ -12,15 +12,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"splitwire/internal/app"
+	"splitwire/internal/loghub"
 	"splitwire/internal/winutil"
 )
 
-const version = "1.2.0"
+const version = "1.2.2-dnsfix1"
 
 const (
 	idConfigEdit = 1001 + iota
@@ -85,7 +85,7 @@ type gui struct {
 	appDir  string
 	logPath string
 	logger  *log.Logger
-	logSink *uiLogSink
+	logRing *loghub.Ring
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
@@ -101,7 +101,6 @@ type gui struct {
 	closing       bool
 
 	initialConfig string
-	initialLog    string
 }
 
 func main() {
@@ -121,7 +120,7 @@ func main() {
 	}
 
 	logPath := filepath.Join(dir, "splitwire.log")
-	initialLog := tailFile(logPath, 160<<10)
+	initialLog := tailFile(logPath, 160<<10) // history is read exactly once at startup
 	lf, err := openLog(logPath)
 	if err != nil {
 		messageBox(0, "SplitWire", "Не удалось открыть лог:\n"+err.Error(), mbOK|mbIconError)
@@ -129,8 +128,10 @@ func main() {
 	}
 	defer lf.Close()
 
-	sink := &uiLogSink{}
-	logger := log.New(io.MultiWriter(lf, sink), "", log.LstdFlags)
+	ring := loghub.NewRing(256 << 10)
+	ring.Seed([]byte(initialLog))
+	hub := loghub.New(lf, ring)
+	logger := log.New(hub, "", log.LstdFlags)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -143,13 +144,12 @@ func main() {
 		appDir:        dir,
 		logPath:       logPath,
 		logger:        logger,
-		logSink:       sink,
+		logRing:       ring,
 		rootCtx:       ctx,
 		rootCancel:    cancel,
 		startResults:  make(chan startResult, 1),
 		stopResults:   make(chan error, 1),
 		initialConfig: initialConfig,
-		initialLog:    initialLog,
 	}
 	activeGUI = g
 	defer func() { activeGUI = nil }()
@@ -167,7 +167,11 @@ func main() {
 		return
 	}
 	g.hwnd = hwnd
-	g.logSink.Attach(hwnd)
+	g.logRing.SetNotify(func() {
+		if g.hwnd != 0 {
+			postMessage(g.hwnd, wmAppLog, 0, 0)
+		}
+	})
 	showWindow(hwnd)
 	setTimer(hwnd, statusTimerID, 1000)
 	g.refreshStatus()
@@ -197,7 +201,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	case wmAppLog:
-		g.drainLog()
+		g.refreshLogRing()
 		return 0
 	case wmAppStartDone:
 		g.finishStart()
@@ -244,7 +248,9 @@ func (g *gui) createControls() {
 	g.groupsEdit = mk("EDIT", "Выберите конфиг для просмотра правил.", wsBorder|wsVScroll|wsHScroll|esMultiline|esAutoVScroll|esAutoHScroll|esReadOnly, idGroups)
 
 	g.logBox = mk("BUTTON", "Лог", bsGroupBox, 0)
-	g.logEdit = mk("EDIT", normalizeEditNewlines(g.initialLog), wsBorder|wsVScroll|wsHScroll|esMultiline|esAutoVScroll|esAutoHScroll|esReadOnly, idLog)
+	g.logEdit = mk("EDIT", "", wsBorder|wsVScroll|wsHScroll|esMultiline|esAutoVScroll|esAutoHScroll|esReadOnly, idLog)
+	setEditLimit(g.logEdit, 512<<10)
+	setText(g.logEdit, normalizeEditNewlines(g.logRing.Snapshot()))
 	scrollEditToEnd(g.logEdit)
 	g.openLogBtn = mk("BUTTON", "Открыть лог", bsPushButton|wsTabStop, idOpenLog)
 	g.clearLogBtn = mk("BUTTON", "Очистить окно", bsPushButton|wsTabStop, idClearLog)
@@ -339,6 +345,7 @@ func (g *gui) command(id int) {
 			messageBox(g.hwnd, "SplitWire", err.Error(), mbOK|mbIconError)
 		}
 	case idClearLog:
+		g.logRing.Clear()
 		setText(g.logEdit, "")
 	}
 }
@@ -562,7 +569,7 @@ func (g *gui) refreshStatus() {
 	setText(g.networkText, fmt.Sprintf("Сеть: %s · endpoint %s", info.Interface, info.Endpoint))
 	setText(g.proxyText, "Доменные правила: "+oneLine(info.HostnameMode, 75))
 	setText(g.trafficText, fmt.Sprintf("Трафик WG: TX %s / RX %s", humanBytes(s.WGTxBytes), humanBytes(s.WGRxBytes)))
-	setText(g.packetsText, fmt.Sprintf("Пакеты: cap %d / WG %d / direct %d / drop %d · proxyWG %d · IP %d", s.Captured, s.Tunneled, s.Bypassed, s.Dropped, s.ProxyTunnel, s.DomainIPs))
+	setText(g.packetsText, fmt.Sprintf("Пакеты: cap %d / WG %d / direct %d / drop %d · qMax %d/%dms · natMiss %d", s.Captured, s.Tunneled, s.Bypassed, s.Dropped, s.SendQueueHigh, s.SendQueueDelayMaxMS, s.ReverseNATMiss))
 }
 
 func (g *gui) openRules() {
@@ -720,76 +727,22 @@ func tailFile(path string, limit int64) string {
 	return string(b)
 }
 
-type uiLogSink struct {
-	mu      sync.Mutex
-	hwnd    uintptr
-	pending []string
-}
-
-func (s *uiLogSink) Write(p []byte) (int, error) {
-	text := string(append([]byte(nil), p...))
-	s.mu.Lock()
-	s.pending = append(s.pending, text)
-	hwnd := s.hwnd
-	s.mu.Unlock()
-	if hwnd != 0 {
-		postMessage(hwnd, wmAppLog, 0, 0)
-	}
-	return len(p), nil
-}
-
-func (s *uiLogSink) Attach(hwnd uintptr) {
-	s.mu.Lock()
-	s.hwnd = hwnd
-	has := len(s.pending) > 0
-	s.mu.Unlock()
-	if has {
-		postMessage(hwnd, wmAppLog, 0, 0)
-	}
-}
-
-func (s *uiLogSink) Drain() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := s.pending
-	s.pending = nil
-	return out
-}
-
-func (g *gui) drainLog() {
-	if g.logEdit == 0 {
+func (g *gui) refreshLogRing() {
+	if g.logEdit == 0 || g.logRing == nil {
 		return
 	}
-	lines := g.logSink.Drain()
-	if len(lines) == 0 {
-		return
+	d := g.logRing.DrainAndAck()
+	text := normalizeEditNewlines(d.Text)
+	if d.Replace {
+		setText(g.logEdit, text)
+	} else if text != "" {
+		appendEditText(g.logEdit, text)
 	}
-
-	// Do not append through EM_REPLACESEL. The log control is ES_READONLY and
-	// normally never receives focus, so it may have no caret/selection state at
-	// all. On a standard Win32 EDIT this can make EM_REPLACESEL a no-op and the
-	// on-disk log keeps growing while the UI stays blank. WM_SETTEXT works
-	// independently of focus/read-only state, so update the visible buffer in one
-	// batch instead.
-	text := getText(g.logEdit)
-	var b strings.Builder
-	b.Grow(len(text) + 4096)
-	b.WriteString(text)
-	for _, line := range lines {
-		b.WriteString(normalizeEditNewlines(line))
-	}
-	r := []rune(b.String())
-	if len(r) > 300000 {
-		r = r[len(r)-180000:]
-	}
-	setText(g.logEdit, string(r))
 	scrollEditToEnd(g.logEdit)
 }
 
 func scrollEditToEnd(hwnd uintptr) {
-	// Use the actual text length instead of the EM_SETSEL(-1,-1) special case.
-	// This is also safe when the user has never focused the read-only log box.
-	n, _, _ := procGetWindowTextLenW.Call(hwnd)
-	sendMessage(hwnd, emSetSel, n, n)
+	n := textLength(hwnd)
+	sendMessage(hwnd, emSetSel, uintptr(n), uintptr(n))
 	sendMessage(hwnd, emScrollCaret, 0, 0)
 }
