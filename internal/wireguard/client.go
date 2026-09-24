@@ -55,9 +55,10 @@ type Diagnostics struct {
 
 type Client struct {
 	p                  Params
-	conn               *net.UDPConn
+	conns              [2]*net.UDPConn
+	localPorts         [2]int
+	activePath         atomic.Uint32
 	endpoint           *net.UDPAddr
-	localPort          int
 	priv               *ecdh.PrivateKey
 	pub                [32]byte
 	peerPub            [32]byte
@@ -164,25 +165,38 @@ func New(p Params) (*Client, error) {
 		network = "udp6"
 		listen = &net.UDPAddr{IP: net.IPv6unspecified, Port: 0}
 	}
-	conn, err := net.ListenUDP(network, listen)
+	openPath := func() (*net.UDPConn, error) {
+		conn, err := net.ListenUDP(network, listen)
+		if err != nil {
+			return nil, err
+		}
+		_ = conn.SetReadBuffer(8 << 20)
+		_ = conn.SetWriteBuffer(8 << 20)
+		if p.InterfaceIndex != 0 {
+			if err := bindUDPToInterface(conn, p.InterfaceIndex, ep.IP.To4() == nil); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("bind WireGuard UDP to physical interface %d: %w", p.InterfaceIndex, err)
+			}
+		}
+		return conn, nil
+	}
+	conn0, err := openPath()
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetReadBuffer(8 << 20)
-	_ = conn.SetWriteBuffer(8 << 20)
-	if p.InterfaceIndex != 0 {
-		if err := bindUDPToInterface(conn, p.InterfaceIndex, ep.IP.To4() == nil); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("bind WireGuard UDP to physical interface %d: %w", p.InterfaceIndex, err)
-		}
+	conn1, err := openPath()
+	if err != nil {
+		conn0.Close()
+		return nil, err
 	}
-	c := &Client{p: p, conn: conn, endpoint: ep, localPort: conn.LocalAddr().(*net.UDPAddr).Port, priv: priv, pub: pub, peerPub: p.PeerPublicKey, psk: p.PresharedKey, respCh: make(chan []byte, 8), cookieCh: make(chan []byte, 8), sessions: map[uint32]*session{}, plain: make(chan []byte, 8192), done: make(chan struct{})}
+	c := &Client{p: p, conns: [2]*net.UDPConn{conn0, conn1}, localPorts: [2]int{conn0.LocalAddr().(*net.UDPAddr).Port, conn1.LocalAddr().(*net.UDPAddr).Port}, endpoint: ep, priv: priv, pub: pub, peerPub: p.PeerPublicKey, psk: p.PresharedKey, respCh: make(chan []byte, 8), cookieCh: make(chan []byte, 8), sessions: map[uint32]*session{}, plain: make(chan []byte, 8192), done: make(chan struct{})}
 	b := append([]byte("mac1----"), c.peerPub[:]...)
 	c.mac1Key = cryptox.Blake2s256(b)
 	b = append([]byte("cookie--"), c.peerPub[:]...)
 	c.cookieKey = cryptox.Blake2s256(b)
-	c.workerWG.Add(2)
-	go func() { defer c.workerWG.Done(); c.reader() }()
+	c.workerWG.Add(3)
+	go func() { defer c.workerWG.Done(); c.reader(c.conns[0]) }()
+	go func() { defer c.workerWG.Done(); c.reader(c.conns[1]) }()
 	go func() { defer c.workerWG.Done(); c.reaper() }()
 	if p.Keepalive > 0 {
 		c.workerWG.Add(1)
@@ -201,7 +215,20 @@ func resolveEndpoint(s string) (*net.UDPAddr, error) {
 	}
 	return a, nil
 }
-func (c *Client) LocalPort() int { return c.localPort }
+func (c *Client) LocalPort() int {
+	return c.localPorts[int(c.activePath.Load()&1)]
+}
+func (c *Client) LocalPorts() (int, int) { return c.localPorts[0], c.localPorts[1] }
+func (c *Client) StandbyPort() int {
+	return c.localPorts[int((c.activePath.Load()&1)^1)]
+}
+func (c *Client) activeConn() *net.UDPConn { return c.conns[int(c.activePath.Load()&1)] }
+func (c *Client) switchActivePath() (oldPort, newPort int) {
+	old := c.activePath.Load() & 1
+	next := old ^ 1
+	c.activePath.Store(next)
+	return c.localPorts[int(old)], c.localPorts[int(next)]
+}
 func (c *Client) EndpointIP() netip.Addr {
 	a, _ := netip.AddrFromSlice(c.endpoint.IP)
 	return a.Unmap()
@@ -221,7 +248,11 @@ func (c *Client) Diagnostics() Diagnostics {
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
-		c.conn.Close()
+		for _, conn := range c.conns {
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
 		c.workerWG.Wait()
 		c.ioMu.Lock()
 		defer c.ioMu.Unlock()
@@ -270,7 +301,7 @@ func (c *Client) SendPacket(ctx context.Context, raw []byte) error {
 	binary.LittleEndian.PutUint32(out[4:8], s.remoteIndex)
 	binary.LittleEndian.PutUint64(out[8:16], counter)
 	copy(out[16:], sealed)
-	n, err := c.conn.WriteToUDP(out, c.endpoint)
+	n, err := c.activeConn().WriteToUDP(out, c.endpoint)
 	if err == nil {
 		c.txBytes.Add(uint64(n))
 		c.txDatagrams.Add(1)
@@ -360,6 +391,8 @@ func (c *Client) startBackgroundRekey(base *session) {
 	}()
 }
 
+var handshakeAttemptTimeout = time.Second
+
 type initState struct {
 	sender      uint32
 	epriv       *ecdh.PrivateKey
@@ -368,16 +401,18 @@ type initState struct {
 }
 
 func (c *Client) handshake(ctx context.Context, label string) (*session, error) {
+	timeoutsOnPath := 0
 	for attempt := 0; attempt < 5; attempt++ {
 		st, msg, err := c.makeInitiation()
 		if err != nil {
 			return nil, err
 		}
-		if _, err = c.conn.WriteToUDP(msg, c.endpoint); err != nil {
+		if _, err = c.activeConn().WriteToUDP(msg, c.endpoint); err != nil {
 			return nil, err
 		}
 		c.log("WireGuard %s attempt %d", label, attempt+1)
-		timer := time.NewTimer(time.Second)
+		timer := time.NewTimer(handshakeAttemptTimeout)
+		timedOut := false
 	wait:
 		for {
 			select {
@@ -396,10 +431,12 @@ func (c *Client) handshake(ctx context.Context, label string) (*session, error) 
 				if len(raw) == cookieSize && binary.LittleEndian.Uint32(raw[4:8]) == st.sender {
 					if c.consumeCookie(st, raw) == nil {
 						timer.Stop()
+						timeoutsOnPath = 0 // the peer answered, so this UDP path is alive
 						break wait
 					}
 				}
 			case <-timer.C:
+				timedOut = true
 				break wait
 			case <-ctx.Done():
 				timer.Stop()
@@ -407,6 +444,14 @@ func (c *Client) handshake(ctx context.Context, label string) (*session, error) 
 			case <-c.done:
 				timer.Stop()
 				return nil, net.ErrClosed
+			}
+		}
+		if timedOut {
+			timeoutsOnPath++
+			if timeoutsOnPath == 3 {
+				oldPort, newPort := c.switchActivePath()
+				c.log("WireGuard %s: 3 handshake timeouts on outer UDP %d; switching to %d", label, oldPort, newPort)
+				timeoutsOnPath = 0
 			}
 		}
 	}
@@ -561,10 +606,10 @@ func (c *Client) installSession(s *session) {
 	c.current = s
 	c.sessMu.Unlock()
 }
-func (c *Client) reader() {
+func (c *Client) reader(conn *net.UDPConn) {
 	buf := make([]byte, 65535)
 	for {
-		n, from, err := c.conn.ReadFromUDP(buf)
+		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			return
 		}

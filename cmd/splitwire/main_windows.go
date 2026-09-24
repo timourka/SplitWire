@@ -20,7 +20,7 @@ import (
 	"splitwire/internal/winutil"
 )
 
-const version = "1.2.2-dnsfix1"
+const version = "1.2.2-stable3timeout1"
 
 const (
 	idConfigEdit = 1001 + iota

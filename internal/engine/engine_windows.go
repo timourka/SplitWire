@@ -111,7 +111,8 @@ func Start(parent context.Context, p Params) (*Runner, error) {
 	// Explicitly include fragment packets. A non-initial fragment has no TCP/UDP
 	// header, so a transport-only filter would otherwise let pieces of the same
 	// datagram escape classification by different routes.
-	filter := fmt.Sprintf("outbound and !loopback and !impostor and ((tcp or (udp and udp.SrcPort != %d)) or fragment)", wg.LocalPort())
+	outer0, outer1 := wg.LocalPorts()
+	filter := fmt.Sprintf("outbound and !loopback and !impostor and ((tcp or (udp and udp.SrcPort != %d and udp.SrcPort != %d)) or fragment)", outer0, outer1)
 	nh, err := windivert.OpenNetwork(filter, 0, 0)
 	if err != nil {
 		return nil, err
@@ -193,7 +194,7 @@ func Start(parent context.Context, p Params) (*Runner, error) {
 	cleanupF = false
 	cleanupD = false
 	cleanupS = false
-	r.log("started on physical interface %s (%d), outer UDP port %d", p.InterfaceName, p.InterfaceIndex, wg.LocalPort())
+	r.log("started on physical interface %s (%d), outer UDP active=%d standby=%d", p.InterfaceName, p.InterfaceIndex, wg.LocalPort(), wg.StandbyPort())
 	return r, nil
 }
 func (r *Runner) goRun(fn func()) { r.wgDone.Add(1); go func() { defer r.wgDone.Done(); fn() }() }
